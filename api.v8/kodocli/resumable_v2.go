@@ -29,14 +29,16 @@ const completePartsRetryTimes = 5
 var ErrMd5NotMatch = httputil.NewError(406, "md5 not match")
 
 //https://github.com/qbox/product/blob/master/kodo/resumable-up-v2/init_parts.md
-func (p Uploader) initParts(ctx context.Context, host, bucket, key string, hasKey bool) (uploadId string, err error) {
+func (p Uploader) initParts(ctx context.Context, host, bucket, key string, hasKey bool) (uploadId string, suggestedPartSize int64, err error) {
 	url1 := fmt.Sprintf("%s/buckets/%s/objects/%s/uploads", host, bucket, encodeKey(key, hasKey))
 	ret := struct {
-		UploadId string `json:"uploadId"`
+		UploadId          string `json:"uploadId"`
+		SuggestedPartSize int64  `json:"suggestedPartSize,omitempty"`
 	}{}
 
 	err = p.Conn.Call(ctx, &ret, "POST", url1)
 	uploadId = ret.UploadId
+	suggestedPartSize = ret.SuggestedPartSize
 	return
 }
 
@@ -122,7 +124,7 @@ func (p Uploader) deleteParts(ctx context.Context, host, bucket, key string, has
 func (p Uploader) Upload(ctx context.Context, ret interface{}, uptoken string, key string, f io.ReaderAt, fsize int64,
 	mp *CompleteMultipart, partNotify func(partIdx int, etag string)) error {
 	uploadParts := p.makeUploadParts(fsize)
-	return p.upload(ctx, ret, uptoken, key, true, f, fsize, uploadParts, mp, partNotify)
+	return p.upload(ctx, ret, uptoken, key, true, f, fsize, true, uploadParts, mp, partNotify)
 }
 
 func (p Uploader) UploadWithParts(ctx context.Context, ret interface{}, uptoken string, key string, f io.ReaderAt, fsize int64, uploadParts []int64,
@@ -130,13 +132,13 @@ func (p Uploader) UploadWithParts(ctx context.Context, ret interface{}, uptoken 
 	if !p.checkUploadParts(fsize, uploadParts) {
 		return errors.New("part size not equal with fsize")
 	}
-	return p.upload(ctx, ret, uptoken, key, true, f, fsize, uploadParts, mp, partNotify)
+	return p.upload(ctx, ret, uptoken, key, true, f, fsize, false, uploadParts, mp, partNotify)
 }
 
 func (p Uploader) UploadWithoutKey(ctx context.Context, ret interface{}, uptoken string, f io.ReaderAt, fsize int64,
 	mp *CompleteMultipart, partNotify func(partIdx int, etag string)) error {
 	uploadParts := p.makeUploadParts(fsize)
-	return p.upload(ctx, ret, uptoken, "", false, f, fsize, uploadParts, mp, partNotify)
+	return p.upload(ctx, ret, uptoken, "", false, f, fsize, true, uploadParts, mp, partNotify)
 }
 
 func (p Uploader) UploadWithoutKeyWithParts(ctx context.Context, ret interface{}, uptoken string, f io.ReaderAt, fsize int64, uploadParts []int64,
@@ -144,10 +146,10 @@ func (p Uploader) UploadWithoutKeyWithParts(ctx context.Context, ret interface{}
 	if !p.checkUploadParts(fsize, uploadParts) {
 		return errors.New("part size not equal with fsize")
 	}
-	return p.upload(ctx, ret, uptoken, "", false, f, fsize, uploadParts, mp, partNotify)
+	return p.upload(ctx, ret, uptoken, "", false, f, fsize, false, uploadParts, mp, partNotify)
 }
 
-func (p Uploader) upload(ctx context.Context, ret interface{}, uptoken, key string, hasKey bool, f io.ReaderAt, fsize int64, uploadParts []int64,
+func (p Uploader) upload(ctx context.Context, ret interface{}, uptoken, key string, hasKey bool, f io.ReaderAt, fsize int64, usePartSizeAsSuggested bool, uploadParts []int64,
 	mp *CompleteMultipart, partNotify func(partIdx int, etag string)) error {
 
 	xl := xlog.FromContextSafe(ctx)
@@ -163,12 +165,16 @@ func (p Uploader) upload(ctx context.Context, ret interface{}, uptoken, key stri
 
 	p.Conn.Client = newUptokenClient(uptoken, p.Conn.Transport)
 	upHost := p.chooseUpHost()
-	uploadId, err := p.initParts(ctx, upHost, bucket, key, hasKey)
+	uploadId, suggestedPartSize, err := p.initParts(ctx, upHost, bucket, key, hasKey)
 	if err != nil {
 		failHostName(upHost)
 		return err
 	} else {
 		succeedHostName(upHost)
+	}
+
+	if usePartSizeAsSuggested && suggestedPartSize > 0 {
+		uploadParts = p.makeUploadPartsByPartSize(fsize, suggestedPartSize)
 	}
 
 	var partUpErr error
@@ -251,12 +257,16 @@ func (p Uploader) upload(ctx context.Context, ret interface{}, uptoken, key stri
 }
 
 func (p Uploader) makeUploadParts(fsize int64) []int64 {
-	partCnt := p.partNumber(fsize)
+	return p.makeUploadPartsByPartSize(fsize, p.UploadPartSize)
+}
+
+func (p Uploader) makeUploadPartsByPartSize(fsize, partSize int64) []int64 {
+	partCnt := p.partNumber(fsize, partSize)
 	uploadParts := make([]int64, partCnt)
 	for i := 0; i < partCnt-1; i++ {
-		uploadParts[i] = p.UploadPartSize
+		uploadParts[i] = partSize
 	}
-	uploadParts[partCnt-1] = fsize - (int64(partCnt)-1)*p.UploadPartSize
+	uploadParts[partCnt-1] = fsize - (int64(partCnt)-1)*partSize
 	return uploadParts
 }
 
@@ -268,8 +278,8 @@ func (p Uploader) checkUploadParts(fsize int64, uploadParts []int64) bool {
 	return fsize == partSize
 }
 
-func (p Uploader) partNumber(fsize int64) int {
-	return int((fsize + p.UploadPartSize - 1) / p.UploadPartSize)
+func (p Uploader) partNumber(fsize, partSize int64) int {
+	return int((fsize + partSize - 1) / partSize)
 }
 
 func NewSectionReader(r io.Reader, n int64) *sectionReader {
@@ -311,7 +321,7 @@ func (p Uploader) streamUpload(ctx context.Context, ret interface{}, uptoken, ke
 
 	p.Conn.Client = newUptokenClient(uptoken, p.Conn.Transport)
 	upHost := p.chooseUpHost()
-	uploadId, err := p.initParts(ctx, upHost, bucket, key, hasKey)
+	uploadId, suggestedPartSize, err := p.initParts(ctx, upHost, bucket, key, hasKey)
 	if err != nil {
 		failHostName(upHost)
 		return err
@@ -320,6 +330,11 @@ func (p Uploader) streamUpload(ctx context.Context, ret interface{}, uptoken, ke
 
 	partUpCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+
+	partSize := p.UploadPartSize
+	if suggestedPartSize > 0 {
+		partSize = suggestedPartSize
+	}
 
 	var parts []Part
 	var partsLock sync.Mutex
@@ -368,7 +383,7 @@ func (p Uploader) streamUpload(ctx context.Context, ret interface{}, uptoken, ke
 	}
 
 	for partNum := 1; ; partNum++ {
-		data, err := ioutil.ReadAll(io.LimitReader(reader, p.UploadPartSize))
+		data, err := ioutil.ReadAll(io.LimitReader(reader, partSize))
 		if err != nil {
 			close(partChan)
 			return err
