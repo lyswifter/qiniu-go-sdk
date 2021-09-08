@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"math"
 	"math/rand"
 	"sort"
 	"strings"
@@ -173,7 +174,9 @@ func (p Uploader) upload(ctx context.Context, ret interface{}, uptoken, key stri
 		succeedHostName(upHost)
 	}
 
+	concurrency := p.Concurrency
 	if usePartSizeAsSuggested && suggestedPartSize > 0 {
+		suggestedPartSize, concurrency = p.adaptivePartSizeAndConcurrency(ctx, suggestedPartSize)
 		uploadParts = p.makeUploadPartsByPartSize(fsize, suggestedPartSize)
 	}
 
@@ -184,7 +187,7 @@ func (p Uploader) upload(ctx context.Context, ret interface{}, uptoken, key stri
 	partUpCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	var bkLimit = limit.NewBlockingCount(p.Concurrency)
+	var bkLimit = limit.NewBlockingCount(concurrency)
 	var wg sync.WaitGroup
 	var lastPartEnd int64 = 0
 	for i := 0; i < partCnt; i++ {
@@ -282,6 +285,28 @@ func (p Uploader) partNumber(fsize, partSize int64) int {
 	return int((fsize + partSize - 1) / partSize)
 }
 
+func (p Uploader) adaptivePartSizeAndConcurrency(ctx context.Context, suggestedPartSizeOrigin int64) (int64, int) {
+	const (
+		PartSizeMin     int64 = 1024 * 1024
+		PartSizeAligned int64 = 1024 * 1024
+	)
+	xl := xlog.FromContextSafe(ctx)
+
+	if suggestedPartSizeOrigin < PartSizeMin {
+		elog.Error(xl.ReqId(), "Suggested part size is too small:", suggestedPartSizeOrigin)
+		return p.UploadPartSize, p.Concurrency
+	}
+
+	suggestedPartSizeNotAligned := suggestedPartSizeOrigin
+	if suggestedPartSizeNotAligned < p.UploadPartSize {
+		suggestedPartSizeNotAligned *= int64(math.Ceil(float64(p.UploadPartSize) / float64(suggestedPartSizeNotAligned)))
+	}
+	suggestedPartSize := suggestedPartSizeNotAligned / PartSizeAligned * PartSizeAligned
+	suggestedConcurrency := int(math.Ceil(float64(int64(p.Concurrency)*p.UploadPartSize) / float64(suggestedPartSize)))
+	elog.Info(xl.ReqId(), "Original suggested part size", suggestedPartSizeOrigin, " Suggested part size:", suggestedPartSize, " Suggested concurrency:", suggestedConcurrency)
+	return suggestedPartSize, suggestedConcurrency
+}
+
 func NewSectionReader(r io.Reader, n int64) *sectionReader {
 	return &sectionReader{r, 0, n}
 }
@@ -332,8 +357,9 @@ func (p Uploader) streamUpload(ctx context.Context, ret interface{}, uptoken, ke
 	defer cancel()
 
 	partSize := p.UploadPartSize
+	concurrency := p.Concurrency
 	if suggestedPartSize > 0 {
-		partSize = suggestedPartSize
+		partSize, concurrency = p.adaptivePartSizeAndConcurrency(ctx, suggestedPartSize)
 	}
 
 	var parts []Part
@@ -345,9 +371,9 @@ func (p Uploader) streamUpload(ctx context.Context, ret interface{}, uptoken, ke
 		PartNumber int
 	}
 	partChan := make(chan PartData)
-	errorChan := make(chan error, p.Concurrency)
+	errorChan := make(chan error, concurrency)
 
-	for i := 0; i < p.Concurrency; i++ {
+	for i := 0; i < concurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
