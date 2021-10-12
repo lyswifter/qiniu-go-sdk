@@ -173,8 +173,10 @@ func (queryer *Queryer) mustQuery() (c *cache, err error) {
 	query.Set("ak", queryer.ak)
 	query.Set("bucket", queryer.bucket)
 
+	failedUcHosts := make(map[string]struct{})
+
 	for i := 0; i < 10; i++ {
-		ucHost := queryer.nextUcHost()
+		ucHost := queryer.nextUcHost(failedUcHosts)
 		url := fmt.Sprintf("%s/v4/query?%s", ucHost, query.Encode())
 		req, err = http.NewRequest(http.MethodGet, url, http.NoBody)
 		if err != nil {
@@ -183,12 +185,14 @@ func (queryer *Queryer) mustQuery() (c *cache, err error) {
 		req.Header.Set("User-Agent", rpc.UserAgent)
 		resp, err = queryClient.Do(req)
 		if err != nil {
+			failedUcHosts[ucHost] = struct{}{}
 			failHostName(ucHost)
 			continue
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode/100 != 2 {
+			failedUcHosts[ucHost] = struct{}{}
 			failHostName(ucHost)
 			err = fmt.Errorf("uc queryV4 status code error: %d", resp.StatusCode)
 			continue
@@ -196,10 +200,12 @@ func (queryer *Queryer) mustQuery() (c *cache, err error) {
 
 		c = new(cache)
 		if err = json.NewDecoder(resp.Body).Decode(&c.CachedHosts); err != nil {
+			failedUcHosts[ucHost] = struct{}{}
 			failHostName(ucHost)
 			continue
 		}
 		if len(c.CachedHosts.Hosts) == 0 {
+			failedUcHosts[ucHost] = struct{}{}
 			failHostName(ucHost)
 			return nil, errors.New("uc queryV4 returns empty hosts")
 		}
@@ -254,7 +260,7 @@ func (queryer *Queryer) cacheKey() string {
 
 var curUcHostIndex uint32 = 0
 
-func (queryer *Queryer) nextUcHost() string {
+func (queryer *Queryer) nextUcHost(failedHosts map[string]struct{}) string {
 	switch len(queryer.ucHosts) {
 	case 0:
 		panic("No Uc hosts is configured")
@@ -265,7 +271,7 @@ func (queryer *Queryer) nextUcHost() string {
 		for i := 0; i <= len(queryer.ucHosts)*MaxFindHostsPrecent/100; i++ {
 			index := int(atomic.AddUint32(&curUcHostIndex, 1) - 1)
 			ucHost = queryer.ucHosts[index%len(queryer.ucHosts)]
-			if isHostNameValid(ucHost) {
+			if _, isFailedBefore := failedHosts[ucHost]; !isFailedBefore && isHostNameValid(ucHost) {
 				break
 			}
 		}

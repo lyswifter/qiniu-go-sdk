@@ -41,7 +41,7 @@ func (l *Lister) batchStat(r io.Reader) []*FileStat {
 
 var curRsHostIndex uint32 = 0
 
-func (l *Lister) nextRsHost() string {
+func (l *Lister) nextRsHost(failedHosts map[string]struct{}) string {
 	rsHosts := l.rsHosts
 	if l.queryer != nil {
 		if hosts := l.queryer.QueryRsHosts(false); len(hosts) > 0 {
@@ -59,7 +59,7 @@ func (l *Lister) nextRsHost() string {
 		for i := 0; i <= len(rsHosts)*MaxFindHostsPrecent/100; i++ {
 			index := int(atomic.AddUint32(&curRsHostIndex, 1) - 1)
 			rsHost = rsHosts[index%len(rsHosts)]
-			if isHostNameValid(rsHost) {
+			if _, isFailedBefore := failedHosts[rsHost]; !isFailedBefore && isHostNameValid(rsHost) {
 				break
 			}
 		}
@@ -69,7 +69,7 @@ func (l *Lister) nextRsHost() string {
 
 var curRsfHostIndex uint32 = 0
 
-func (l *Lister) nextRsfHost() string {
+func (l *Lister) nextRsfHost(failedHosts map[string]struct{}) string {
 	rsfHosts := l.rsfHosts
 	if l.queryer != nil {
 		if hosts := l.queryer.QueryRsfHosts(false); len(hosts) > 0 {
@@ -87,7 +87,7 @@ func (l *Lister) nextRsfHost() string {
 		for i := 0; i <= len(rsfHosts)*MaxFindHostsPrecent/100; i++ {
 			index := int(atomic.AddUint32(&curRsfHostIndex, 1) - 1)
 			rsfHost = rsfHosts[index%len(rsfHosts)]
-			if isHostNameValid(rsfHost) {
+			if _, isFailedBefore := failedHosts[rsfHost]; !isFailedBefore && isHostNameValid(rsfHost) {
 				break
 			}
 		}
@@ -97,16 +97,19 @@ func (l *Lister) nextRsfHost() string {
 
 // 重命名对象
 func (l *Lister) Rename(fromKey, toKey string) error {
-	host := l.nextRsHost()
+	failedRsHosts := make(map[string]struct{})
+	host := l.nextRsHost(failedRsHosts)
 	bucket := l.newBucket(host, "")
 	err := bucket.Move(nil, fromKey, toKey)
 	if err != nil {
+		failedRsHosts[host] = struct{}{}
 		failHostName(host)
 		elog.Info("rename retry 0", host, err)
-		host = l.nextRsHost()
+		host = l.nextRsHost(failedRsHosts)
 		bucket = l.newBucket(host, "")
 		err = bucket.Move(nil, fromKey, toKey)
 		if err != nil {
+			failedRsHosts[host] = struct{}{}
 			failHostName(host)
 			elog.Info("rename retry 1", host, err)
 			return err
@@ -121,16 +124,19 @@ func (l *Lister) Rename(fromKey, toKey string) error {
 
 // 移动对象到指定存储空间的指定对象中
 func (l *Lister) MoveTo(fromKey, toBucket, toKey string) error {
-	host := l.nextRsHost()
+	failedRsHosts := make(map[string]struct{})
+	host := l.nextRsHost(failedRsHosts)
 	bucket := l.newBucket(host, "")
 	err := bucket.MoveEx(nil, fromKey, toBucket, toKey)
 	if err != nil {
+		failedRsHosts[host] = struct{}{}
 		failHostName(host)
 		elog.Info("move retry 0", host, err)
-		host = l.nextRsHost()
+		host = l.nextRsHost(failedRsHosts)
 		bucket = l.newBucket(host, "")
 		err = bucket.MoveEx(nil, fromKey, toBucket, toKey)
 		if err != nil {
+			failedRsHosts[host] = struct{}{}
 			failHostName(host)
 			elog.Info("move retry 1", host, err)
 			return err
@@ -145,16 +151,19 @@ func (l *Lister) MoveTo(fromKey, toBucket, toKey string) error {
 
 // 复制对象到当前存储空间的指定对象中
 func (l *Lister) Copy(fromKey, toKey string) error {
-	host := l.nextRsHost()
+	failedRsHosts := make(map[string]struct{})
+	host := l.nextRsHost(failedRsHosts)
 	bucket := l.newBucket(host, "")
 	err := bucket.Copy(nil, fromKey, toKey)
 	if err != nil {
+		failedRsHosts[host] = struct{}{}
 		failHostName(host)
 		elog.Info("copy retry 0", host, err)
-		host = l.nextRsHost()
+		host = l.nextRsHost(failedRsHosts)
 		bucket = l.newBucket(host, "")
 		err = bucket.Copy(nil, fromKey, toKey)
 		if err != nil {
+			failedRsHosts[host] = struct{}{}
 			failHostName(host)
 			elog.Info("copy retry 1", host, err)
 			return err
@@ -169,16 +178,19 @@ func (l *Lister) Copy(fromKey, toKey string) error {
 
 // 删除指定对象
 func (l *Lister) Delete(key string) error {
-	host := l.nextRsHost()
+	failedRsHosts := make(map[string]struct{})
+	host := l.nextRsHost(failedRsHosts)
 	bucket := l.newBucket(host, "")
 	err := bucket.Delete(nil, key)
 	if err != nil {
+		failedRsHosts[host] = struct{}{}
 		failHostName(host)
 		elog.Info("delete retry 0", host, err)
-		host = l.nextRsHost()
+		host = l.nextRsHost(failedRsHosts)
 		bucket = l.newBucket(host, "")
 		err = bucket.Delete(nil, key)
 		if err != nil {
+			failedRsHosts[host] = struct{}{}
 			failHostName(host)
 			elog.Info("delete retry 1", host, err)
 			return err
@@ -209,22 +221,35 @@ func (l *Lister) ListStat(paths []string) []*FileStat {
 		stats    = make([]*FileStat, len(paths))
 		finalErr error
 		lock     sync.Mutex
+
+		failedRsHosts     = make(map[string]struct{})
+		failedRsHostsLock sync.RWMutex
 	)
 	wg.Add(concurrency)
 	for i := 0; i < concurrency; i++ {
 		go func() {
 			defer wg.Done()
 			for pi := range c {
-				host := l.nextRsHost()
+				failedRsHostsLock.RLock()
+				host := l.nextRsHost(failedRsHosts)
+				failedRsHostsLock.RUnlock()
 				bucket := l.newBucket(host, "")
 				r, err := bucket.BatchStat(nil, pi.paths...)
 				if err != nil {
+					failedRsHostsLock.Lock()
+					failedRsHosts[host] = struct{}{}
+					failedRsHostsLock.Unlock()
 					failHostName(host)
 					elog.Info("batchStat retry 0", host, err)
-					host = l.nextRsHost()
+					failedRsHostsLock.RLock()
+					host = l.nextRsHost(failedRsHosts)
+					failedRsHostsLock.RUnlock()
 					bucket = l.newBucket(host, "")
 					r, err = bucket.BatchStat(nil, pi.paths...)
 					if err != nil {
+						failedRsHostsLock.Lock()
+						failedRsHosts[host] = struct{}{}
+						failedRsHostsLock.Unlock()
 						failHostName(host)
 						elog.Info("batchStat retry 1", host, err)
 						lock.Lock()
@@ -269,20 +294,23 @@ func (l *Lister) ListStat(paths []string) []*FileStat {
 
 // 根据前缀列举存储空间
 func (l *Lister) ListPrefix(prefix string) []string {
-	rsHost := l.nextRsHost()
-	rsfHost := l.nextRsfHost()
+	failedHosts := make(map[string]struct{})
+	rsHost := l.nextRsHost(failedHosts)
+	rsfHost := l.nextRsfHost(failedHosts)
 	bucket := l.newBucket(rsHost, rsfHost)
 	var files []string
 	marker := ""
 	for {
 		r, _, out, err := bucket.List(nil, prefix, "", marker, 1000)
 		if err != nil && err != io.EOF {
+			failedHosts[rsfHost] = struct{}{}
 			failHostName(rsfHost)
 			elog.Info("ListPrefix retry 0", rsfHost, err)
-			rsfHost = l.nextRsfHost()
+			rsfHost = l.nextRsfHost(failedHosts)
 			bucket = l.newBucket(rsHost, rsfHost)
 			r, _, out, err = bucket.List(nil, prefix, "", "", 1000)
 			if err != nil {
+				failedHosts[rsfHost] = struct{}{}
 				failHostName(rsfHost)
 				elog.Info("ListPrefix retry 1", rsfHost, err)
 				return []string{}
