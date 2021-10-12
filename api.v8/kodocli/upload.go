@@ -123,6 +123,7 @@ func (p Uploader) put(
 
 	tryTimes := formUploadRetryTimes
 	xl := xlog.NewWith(xlog.FromContextSafe(ctx).ReqId())
+	failedUpHosts := make(map[string]struct{})
 
 lzRetry:
 	var data io.Reader = io.NewSectionReader(dataReaderAt, 0, size)
@@ -190,7 +191,7 @@ lzRetry:
 
 	contentType := writer.FormDataContentType()
 	var req *http.Request
-	upHost := p.chooseUpHost()
+	upHost := p.chooseUpHost(failedUpHosts)
 	req, err = rpc.NewRequest("POST", upHost, io.MultiReader(mr, eofReaderFunc(func() {
 		if extra.Md5Trailer != nil {
 			if m := extra.Md5Trailer(); m != nil && req != nil {
@@ -199,6 +200,7 @@ lzRetry:
 		}
 	})))
 	if err != nil {
+		failedUpHosts[upHost] = struct{}{}
 		failHostName(upHost)
 		return
 	}
@@ -214,11 +216,13 @@ lzRetry:
 		}
 		code := httputil.DetectCode(err)
 		if code == 509 {
+			failedUpHosts[upHost] = struct{}{}
 			failHostName(upHost)
 			elog.Warn(xl.ReqId(), "formUploadRetryLater:", err)
 			time.Sleep(time.Second * time.Duration(rand.Intn(9)+1))
 			goto lzRetry
 		} else if tryTimes > 1 && (code == 406 || code/100 != 4) {
+			failedUpHosts[upHost] = struct{}{}
 			failHostName(upHost)
 			tryTimes--
 			elog.Warn(xl.ReqId(), "formUploadRetry:", err)
@@ -229,6 +233,7 @@ lzRetry:
 	}
 	err = rpc.CallRet(ctx, ret, resp)
 	if err != nil {
+		failedUpHosts[upHost] = struct{}{}
 		failHostName(upHost)
 	} else {
 		succeedHostName(upHost)
@@ -369,7 +374,7 @@ func (p Uploader) Put2(
 func (p Uploader) put2(ctx Context, ret interface{}, uptoken, key string, data io.ReaderAt, size int64,
 	extra *PutExtra) error {
 
-	upHost := p.chooseUpHost()
+	upHost := p.chooseUpHost(make(map[string]struct{}))
 	url := upHost + "/put/" + strconv.FormatInt(size, 10)
 	if extra != nil {
 		if extra.MimeType != "" {

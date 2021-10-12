@@ -11,7 +11,7 @@ import (
 
 var curUpHostIndex uint32 = 0
 
-func (p Uploader) chooseUpHost() string {
+func (p Uploader) chooseUpHost(failedHosts map[string]struct{}) string {
 	switch len(p.UpHosts) {
 	case 0:
 		panic("No Up hosts is configured")
@@ -22,7 +22,7 @@ func (p Uploader) chooseUpHost() string {
 		for i := 0; i <= len(p.UpHosts)*MaxFindHostsPrecent/100; i++ {
 			index := int(atomic.AddUint32(&curUpHostIndex, 1) - 1)
 			upHost = p.UpHosts[index%len(p.UpHosts)]
-			if isHostNameValid(upHost) {
+			if _, isFailedBefore := failedHosts[upHost]; !isFailedBefore && isHostNameValid(upHost) {
 				break
 			}
 		}

@@ -223,6 +223,7 @@ func (p Uploader) rput(
 	blkSize := 1 << blockBits
 	nfails := 0
 	p.Conn.Client = newUptokenClient(uptoken, p.Conn.Transport)
+	failedUpHosts := make(map[string]struct{})
 
 	for i := 0; i < blockCnt; i++ {
 		blkIdx := i
@@ -235,9 +236,10 @@ func (p Uploader) rput(
 			defer wg.Done()
 			tryTimes := extra.TryTimes
 		lzRetry:
-			upHost := p.chooseUpHost()
+			upHost := p.chooseUpHost(failedUpHosts)
 			err := p.resumableBput(ctx, upHost, &extra.Progresses[blkIdx], f, blkIdx, blkSize1, extra)
 			if err != nil {
+				failedUpHosts[upHost] = struct{}{}
 				failHostName(upHost)
 				if tryTimes > 1 {
 					tryTimes--
@@ -259,7 +261,7 @@ func (p Uploader) rput(
 		return ErrPutFailed
 	}
 
-	return p.mkfile(ctx, p.chooseUpHost(), ret, key, hasKey, fsize, extra)
+	return p.mkfile(ctx, p.chooseUpHost(failedUpHosts), ret, key, hasKey, fsize, extra)
 }
 
 func (p Uploader) rputFile(

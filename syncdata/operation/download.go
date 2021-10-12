@@ -72,8 +72,9 @@ func NewDownloaderV2() *Downloader {
 
 // 下载指定对象到文件里
 func (d *Downloader) DownloadFile(key, path string) (f *os.File, err error) {
+	failedIoHosts := make(map[string]struct{})
 	for i := 0; i < 3; i++ {
-		f, err = d.downloadFileInner(key, path)
+		f, err = d.downloadFileInner(key, path, failedIoHosts)
 		if err == nil {
 			return
 		}
@@ -83,8 +84,9 @@ func (d *Downloader) DownloadFile(key, path string) (f *os.File, err error) {
 
 // 下载指定对象到文件里
 func (d *Downloader) DownloadBytes(key string) (data []byte, err error) {
+	failedIoHosts := make(map[string]struct{})
 	for i := 0; i < 3; i++ {
-		data, err = d.downloadBytesInner(key)
+		data, err = d.downloadBytesInner(key, failedIoHosts)
 		if err == nil {
 			break
 		}
@@ -94,8 +96,9 @@ func (d *Downloader) DownloadBytes(key string) (data []byte, err error) {
 
 // 下载指定对象的指定范围到内存中
 func (d *Downloader) DownloadRangeBytes(key string, offset, size int64) (l int64, data []byte, err error) {
+	failedIoHosts := make(map[string]struct{})
 	for i := 0; i < 3; i++ {
-		l, data, err = d.downloadRangeBytesInner(key, offset, size)
+		l, data, err = d.downloadRangeBytesInner(key, offset, size, failedIoHosts)
 		if err == nil {
 			break
 		}
@@ -115,7 +118,7 @@ func fileExists(filename string) bool {
 
 var curIoHostIndex uint32 = 0
 
-func (d *Downloader) nextHost() string {
+func (d *Downloader) nextHost(failedHosts map[string]struct{}) string {
 	ioHosts := d.ioHosts
 	if d.queryer != nil {
 		if hosts := d.queryer.QueryIoHosts(false); len(hosts) > 0 {
@@ -133,7 +136,7 @@ func (d *Downloader) nextHost() string {
 		for i := 0; i <= len(ioHosts)*MaxFindHostsPrecent/100; i++ {
 			index := int(atomic.AddUint32(&curIoHostIndex, 1) - 1)
 			ioHost = ioHosts[index%len(ioHosts)]
-			if isHostNameValid(ioHost) {
+			if _, isFailedBefore := failedHosts[ioHost]; !isFailedBefore && isHostNameValid(ioHost) {
 				break
 			}
 		}
@@ -141,10 +144,8 @@ func (d *Downloader) nextHost() string {
 	}
 }
 
-func (d *Downloader) downloadFileInner(key, path string) (*os.File, error) {
-	if strings.HasPrefix(key, "/") {
-		key = strings.TrimPrefix(key, "/")
-	}
+func (d *Downloader) downloadFileInner(key, path string, failedIoHosts map[string]struct{}) (*os.File, error) {
+	key = strings.TrimPrefix(key, "/")
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
 		return nil, err
@@ -153,12 +154,13 @@ func (d *Downloader) downloadFileInner(key, path string) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	host := d.nextHost()
+	host := d.nextHost(failedIoHosts)
 
 	fmt.Println("remote path", key)
 	url := fmt.Sprintf("%s/getfile/%s/%s/%s", host, d.credentials.AccessKey, d.bucket, key)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
+		failedIoHosts[host] = struct{}{}
 		failHostName(host)
 		return nil, err
 	}
@@ -172,6 +174,7 @@ func (d *Downloader) downloadFileInner(key, path string) (*os.File, error) {
 
 	response, err := downloadClient.Do(req)
 	if err != nil {
+		failedIoHosts[host] = struct{}{}
 		failHostName(host)
 		return nil, err
 	}
@@ -181,6 +184,7 @@ func (d *Downloader) downloadFileInner(key, path string) (*os.File, error) {
 		return f, nil
 	}
 	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusPartialContent {
+		failedIoHosts[host] = struct{}{}
 		failHostName(host)
 		return nil, errors.New(response.Status)
 	}
@@ -197,11 +201,9 @@ func (d *Downloader) downloadFileInner(key, path string) (*os.File, error) {
 	return f, nil
 }
 
-func (d *Downloader) downloadBytesInner(key string) ([]byte, error) {
-	if strings.HasPrefix(key, "/") {
-		key = strings.TrimPrefix(key, "/")
-	}
-	host := d.nextHost()
+func (d *Downloader) downloadBytesInner(key string, failedIoHosts map[string]struct{}) ([]byte, error) {
+	key = strings.TrimPrefix(key, "/")
+	host := d.nextHost(failedIoHosts)
 
 	url := fmt.Sprintf("%s/getfile/%s/%s/%s", host, d.credentials.AccessKey, d.bucket, key)
 	req, err := http.NewRequest("GET", url, nil)
@@ -211,12 +213,14 @@ func (d *Downloader) downloadBytesInner(key string) ([]byte, error) {
 	req.Header.Set("User-Agent", rpc.UserAgent)
 	response, err := downloadClient.Do(req)
 	if err != nil {
+		failedIoHosts[host] = struct{}{}
 		failHostName(host)
 		return nil, err
 	}
 	defer response.Body.Close()
 
 	if response.StatusCode != http.StatusOK {
+		failedIoHosts[host] = struct{}{}
 		failHostName(host)
 		return nil, errors.New(response.Status)
 	}
@@ -231,15 +235,14 @@ func generateRange(offset, size int64) string {
 	return fmt.Sprintf("bytes=%d-%d", offset, offset+size)
 }
 
-func (d *Downloader) downloadRangeBytesInner(key string, offset, size int64) (int64, []byte, error) {
-	if strings.HasPrefix(key, "/") {
-		key = strings.TrimPrefix(key, "/")
-	}
-	host := d.nextHost()
+func (d *Downloader) downloadRangeBytesInner(key string, offset, size int64, failedIoHosts map[string]struct{}) (int64, []byte, error) {
+	key = strings.TrimPrefix(key, "/")
+	host := d.nextHost(failedIoHosts)
 
 	url := fmt.Sprintf("%s/getfile/%s/%s/%s", host, d.credentials.AccessKey, d.bucket, key)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
+		failedIoHosts[host] = struct{}{}
 		failHostName(host)
 		return -1, nil, err
 	}
@@ -248,29 +251,34 @@ func (d *Downloader) downloadRangeBytesInner(key string, offset, size int64) (in
 	req.Header.Set("User-Agent", rpc.UserAgent)
 	response, err := downloadClient.Do(req)
 	if err != nil {
+		failedIoHosts[host] = struct{}{}
 		failHostName(host)
 		return -1, nil, err
 	}
 	defer response.Body.Close()
 
 	if response.StatusCode != http.StatusPartialContent {
+		failedIoHosts[host] = struct{}{}
 		failHostName(host)
 		return -1, nil, errors.New(response.Status)
 	}
 
 	rangeResponse := response.Header.Get("Content-Range")
 	if rangeResponse == "" {
+		failedIoHosts[host] = struct{}{}
 		failHostName(host)
 		return -1, nil, errors.New("no content range")
 	}
 
 	l, err := getTotalLength(rangeResponse)
 	if err != nil {
+		failedIoHosts[host] = struct{}{}
 		failHostName(host)
 		return -1, nil, err
 	}
 	b, err := ioutil.ReadAll(response.Body)
 	if err != nil {
+		failedIoHosts[host] = struct{}{}
 		failHostName(host)
 	} else {
 		succeedHostName(host)

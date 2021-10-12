@@ -165,7 +165,7 @@ func (p Uploader) upload(ctx context.Context, ret interface{}, uptoken, key stri
 	bucket := strings.Split(policy.Scope, ":")[0]
 
 	p.Conn.Client = newUptokenClient(uptoken, p.Conn.Transport)
-	upHost := p.chooseUpHost()
+	upHost := p.chooseUpHost(make(map[string]struct{}))
 	uploadId, suggestedPartSize, err := p.initParts(ctx, upHost, bucket, key, hasKey)
 	if err != nil {
 		failHostName(upHost)
@@ -345,7 +345,7 @@ func (p Uploader) streamUpload(ctx context.Context, ret interface{}, uptoken, ke
 	bucket := strings.Split(policy.Scope, ":")[0]
 
 	p.Conn.Client = newUptokenClient(uptoken, p.Conn.Transport)
-	upHost := p.chooseUpHost()
+	upHost := p.chooseUpHost(map[string]struct{}{})
 	uploadId, suggestedPartSize, err := p.initParts(ctx, upHost, bucket, key, hasKey)
 	if err != nil {
 		failHostName(upHost)
@@ -439,9 +439,10 @@ func (p Uploader) streamUpload(ctx context.Context, ret interface{}, uptoken, ke
 func (p Uploader) uploadPartWithRetry(ctx context.Context, bucket, key string, hasKey bool, uploadId string, partNum int, getBody func() (io.Reader, int)) (ret UploadPartRet, err error) {
 	xl := xlog.NewWith(xlog.FromContextSafe(ctx).ReqId() + "." + fmt.Sprint(partNum))
 	tryTimes := uploadPartRetryTimes
+	failedUpHosts := make(map[string]struct{})
 
 	for {
-		upHost := p.chooseUpHost()
+		upHost := p.chooseUpHost(failedUpHosts)
 		bodyReader, bodySize := getBody()
 		ret, err = p.uploadPart(ctx, upHost, bucket, key, hasKey, uploadId, partNum, bodyReader, bodySize)
 		if err == nil {
@@ -453,10 +454,12 @@ func (p Uploader) uploadPartWithRetry(ctx context.Context, bucket, key string, h
 			}
 			code := httputil.DetectCode(err)
 			if code == 509 { // 因为流量受限失败，不减少重试次数
+				failedUpHosts[upHost] = struct{}{}
 				failHostName(upHost)
 				elog.Warn(xl.ReqId(), "uploadPartRetryLater:", partNum, err)
 				time.Sleep(time.Second * time.Duration(rand.Intn(9)+1))
 			} else if tryTimes > 1 && (code == 406 || code/100 != 4) {
+				failedUpHosts[upHost] = struct{}{}
 				failHostName(upHost)
 				tryTimes--
 				elog.Warn(xl.ReqId(), "uploadPartRetry:", partNum, err)
@@ -472,9 +475,10 @@ func (p Uploader) uploadPartWithRetry(ctx context.Context, bucket, key string, h
 
 func (p Uploader) completePartsWithRetry(ctx context.Context, ret interface{}, bucket, key string, hasKey bool, uploadId string, mp *CompleteMultipart) (err error) {
 	xl := xlog.FromContextSafe(ctx)
+	failedUpHosts := make(map[string]struct{})
 
 	for i := 0; i < completePartsRetryTimes; i++ {
-		upHost := p.chooseUpHost()
+		upHost := p.chooseUpHost(failedUpHosts)
 		err = p.completeParts(ctx, upHost, ret, bucket, key, hasKey, uploadId, mp)
 		if err == context.Canceled {
 			break
@@ -488,6 +492,7 @@ func (p Uploader) completePartsWithRetry(ctx context.Context, ret interface{}, b
 			}
 			break
 		} else {
+			failedUpHosts[upHost] = struct{}{}
 			failHostName(upHost)
 			elog.Error(xl.ReqId(), "completeParts:", err, code)
 			time.Sleep(time.Second * 3)
@@ -498,9 +503,10 @@ func (p Uploader) completePartsWithRetry(ctx context.Context, ret interface{}, b
 
 func (p Uploader) deletePartsWithRetry(ctx context.Context, bucket, key string, hasKey bool, uploadId string) (err error) {
 	xl := xlog.FromContextSafe(ctx)
+	failedUpHosts := make(map[string]struct{})
 
 	for i := 0; i < deletePartsRetryTimes; i++ {
-		upHost := p.chooseUpHost()
+		upHost := p.chooseUpHost(failedUpHosts)
 		err = p.deleteParts(ctx, upHost, bucket, key, hasKey, uploadId)
 		if err == context.Canceled {
 			break
@@ -510,6 +516,7 @@ func (p Uploader) deletePartsWithRetry(ctx context.Context, bucket, key string, 
 			succeedHostName(upHost)
 			break
 		} else {
+			failedUpHosts[upHost] = struct{}{}
 			failHostName(upHost)
 			elog.Error(xl.ReqId(), "deleteParts:", err)
 			time.Sleep(time.Second * 3)
