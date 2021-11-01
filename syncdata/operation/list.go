@@ -1,6 +1,7 @@
 package operation
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"sync"
@@ -205,36 +206,29 @@ func (l *Lister) Delete(key string) error {
 
 // 获取指定对象列表的元信息
 func (l *Lister) ListStat(paths []string) []*FileStat {
-	type PathWithIdx struct {
-		paths []string
-		index int
-	}
-
 	concurrency := (len(paths) + l.batchSize - 1) / l.batchSize
 	if concurrency > l.batchConcurrency {
 		concurrency = l.batchConcurrency
 	}
-
 	var (
-		wg       sync.WaitGroup
-		c        = make(chan PathWithIdx)
-		stats    = make([]*FileStat, len(paths))
-		finalErr error
-		lock     sync.Mutex
-
+		stats             = make([]*FileStat, len(paths))
 		failedRsHosts     = make(map[string]struct{})
 		failedRsHostsLock sync.RWMutex
+		pool              = newGoroutinePool(concurrency)
 	)
-	wg.Add(concurrency)
-	for i := 0; i < concurrency; i++ {
-		go func() {
-			defer wg.Done()
-			for pi := range c {
+
+	for i := 0; i < len(paths); i += l.batchSize {
+		size := l.batchSize
+		if size > len(paths)-i {
+			size = len(paths) - i
+		}
+		func(paths []string, index int) {
+			pool.Go(func(ctx context.Context) error {
 				failedRsHostsLock.RLock()
 				host := l.nextRsHost(failedRsHosts)
 				failedRsHostsLock.RUnlock()
 				bucket := l.newBucket(host, "")
-				r, err := bucket.BatchStat(nil, pi.paths...)
+				r, err := bucket.BatchStat(ctx, paths...)
 				if err != nil {
 					failedRsHostsLock.Lock()
 					failedRsHosts[host] = struct{}{}
@@ -245,47 +239,33 @@ func (l *Lister) ListStat(paths []string) []*FileStat {
 					host = l.nextRsHost(failedRsHosts)
 					failedRsHostsLock.RUnlock()
 					bucket = l.newBucket(host, "")
-					r, err = bucket.BatchStat(nil, pi.paths...)
+					r, err = bucket.BatchStat(ctx, paths...)
 					if err != nil {
 						failedRsHostsLock.Lock()
 						failedRsHosts[host] = struct{}{}
 						failedRsHostsLock.Unlock()
 						failHostName(host)
 						elog.Info("batchStat retry 1", host, err)
-						lock.Lock()
-						finalErr = err
-						lock.Unlock()
-						return
+						return err
 					} else {
 						succeedHostName(host)
 					}
 				} else {
 					succeedHostName(host)
 				}
-				lock.Lock()
 				for j, v := range r {
 					if v.Code != 200 {
-						stats[pi.index+j] = &FileStat{Name: pi.paths[j], Size: -1}
-						elog.Warn("stat bad file:", pi.paths[j], "with code:", v.Code)
+						stats[index+j] = &FileStat{Name: paths[j], Size: -1}
+						elog.Warn("stat bad file:", paths[j], "with code:", v.Code)
 					} else {
-						stats[pi.index+j] = &FileStat{Name: pi.paths[j], Size: v.Data.Fsize}
+						stats[index+j] = &FileStat{Name: paths[j], Size: v.Data.Fsize}
 					}
 				}
-				lock.Unlock()
-			}
-		}()
+				return nil
+			})
+		}(paths[i:i+size], i)
 	}
-
-	for i := 0; i < len(paths); i += l.batchSize {
-		size := l.batchSize
-		if size > len(paths)-i {
-			size = len(paths) - i
-		}
-		c <- PathWithIdx{paths: paths[i : i+size], index: i}
-	}
-	close(c)
-	wg.Wait()
-	if finalErr != nil {
+	if err := pool.Wait(context.Background()); err != nil {
 		return []*FileStat{}
 	} else {
 		return stats
