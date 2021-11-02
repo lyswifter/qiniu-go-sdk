@@ -18,6 +18,76 @@ import (
 
 // 上传器
 type Uploader struct {
+	config                Configurable
+	singleClusterUploader *singleClusterUploader
+}
+
+// 根据配置创建上传器
+func NewUploader(c *Config) *Uploader {
+	return &Uploader{config: c, singleClusterUploader: newSingleClusterUploader(c)}
+}
+
+// 根据环境变量创建上传器
+func NewUploaderV2() *Uploader {
+	c := getCurrentConfigurable()
+	if c == nil {
+		return nil
+	} else if singleClusterConfig, ok := c.(*Config); ok {
+		return NewUploader(singleClusterConfig)
+	} else {
+		return &Uploader{config: c}
+	}
+}
+
+// 上传内存数据到指定对象中
+func (p *Uploader) UploadData(data []byte, key string) (err error) {
+	if p.singleClusterUploader != nil {
+		return p.singleClusterUploader.uploadData(data, key)
+	}
+	if config, exists := p.config.forKey(key); !exists {
+		return ErrUndefinedConfig
+	} else {
+		return newSingleClusterUploader(config).uploadData(data, key)
+	}
+}
+
+// 从 Reader 中阅读指定大小的数据并上传到指定对象中
+func (p *Uploader) UploadDataReader(data io.ReaderAt, size int, key string) (err error) {
+	if p.singleClusterUploader != nil {
+		return p.singleClusterUploader.uploadDataReader(data, size, key)
+	}
+	if config, exists := p.config.forKey(key); !exists {
+		return ErrUndefinedConfig
+	} else {
+		return newSingleClusterUploader(config).uploadDataReader(data, size, key)
+	}
+}
+
+// 上传指定文件到指定对象中
+func (p *Uploader) Upload(file string, key string) (err error) {
+	if p.singleClusterUploader != nil {
+		return p.singleClusterUploader.upload(file, key)
+	}
+	if config, exists := p.config.forKey(key); !exists {
+		return ErrUndefinedConfig
+	} else {
+		return newSingleClusterUploader(config).upload(file, key)
+	}
+}
+
+// 从 Reader 中阅读全部数据并上传到指定对象中
+func (p *Uploader) UploadReader(reader io.Reader, key string) (err error) {
+	if p.singleClusterUploader != nil {
+		return p.singleClusterUploader.uploadReader(reader, key)
+	}
+	if config, exists := p.config.forKey(key); !exists {
+		return ErrUndefinedConfig
+	} else {
+		return newSingleClusterUploader(config).uploadReader(reader, key)
+	}
+}
+
+type singleClusterUploader struct {
 	bucket        string
 	upHosts       []string
 	credentials   *qbox.Mac
@@ -26,7 +96,29 @@ type Uploader struct {
 	queryer       *Queryer
 }
 
-func (p *Uploader) makeUptoken(policy *kodo.PutPolicy) string {
+func newSingleClusterUploader(c *Config) *singleClusterUploader {
+	mac := qbox.NewMac(c.Ak, c.Sk)
+	part := c.PartSize * 1024 * 1024
+	if part < 4*1024*1024 {
+		part = 4 * 1024 * 1024
+	}
+	var queryer *Queryer = nil
+
+	if len(c.UcHosts) > 0 {
+		queryer = NewQueryer(c)
+	}
+
+	return &singleClusterUploader{
+		bucket:        c.Bucket,
+		upHosts:       dupStrings(c.UpHosts),
+		credentials:   mac,
+		partSize:      part,
+		upConcurrency: c.UpConcurrency,
+		queryer:       queryer,
+	}
+}
+
+func (p *singleClusterUploader) makeUptoken(policy *kodo.PutPolicy) string {
 	var rr = *policy
 	if rr.Expires == 0 {
 		rr.Expires = 3600 + uint32(time.Now().Unix())
@@ -35,8 +127,7 @@ func (p *Uploader) makeUptoken(policy *kodo.PutPolicy) string {
 	return qbox.SignWithData(p.credentials, b)
 }
 
-// 上传内存数据到指定对象中
-func (p *Uploader) UploadData(data []byte, key string) (err error) {
+func (p *singleClusterUploader) uploadData(data []byte, key string) (err error) {
 	t := time.Now()
 	defer func() {
 		elog.Info("up time ", key, time.Now().Sub(t))
@@ -71,8 +162,7 @@ func (p *Uploader) UploadData(data []byte, key string) (err error) {
 	return
 }
 
-// 从 Reader 中阅读指定大小的数据并上传到指定对象中
-func (p *Uploader) UploadDataReader(data io.ReaderAt, size int, key string) (err error) {
+func (p *singleClusterUploader) uploadDataReader(data io.ReaderAt, size int, key string) (err error) {
 	t := time.Now()
 	defer func() {
 		elog.Info("up time ", key, time.Now().Sub(t))
@@ -108,8 +198,7 @@ func (p *Uploader) UploadDataReader(data io.ReaderAt, size int, key string) (err
 	return
 }
 
-// 上传指定文件到指定对象中
-func (p *Uploader) Upload(file string, key string) (err error) {
+func (p *singleClusterUploader) upload(file string, key string) (err error) {
 	t := time.Now()
 	defer func() {
 		elog.Info("up time ", key, time.Now().Sub(t))
@@ -171,8 +260,7 @@ func (p *Uploader) Upload(file string, key string) (err error) {
 	return
 }
 
-// 从 Reader 中阅读全部数据并上传到指定对象中
-func (p *Uploader) UploadReader(reader io.Reader, key string) (err error) {
+func (p *singleClusterUploader) uploadReader(reader io.Reader, key string) (err error) {
 	t := time.Now()
 	defer func() {
 		elog.Info("up time ", key, time.Now().Sub(t))
@@ -230,38 +318,6 @@ func (p *Uploader) UploadReader(reader io.Reader, key string) (err error) {
 			elog.Info("callback", partIdx, etag)
 		})
 	return err
-}
-
-// 根据配置创建上传器
-func NewUploader(c *Config) *Uploader {
-	mac := qbox.NewMac(c.Ak, c.Sk)
-	part := c.PartSize * 1024 * 1024
-	if part < 4*1024*1024 {
-		part = 4 * 1024 * 1024
-	}
-	var queryer *Queryer = nil
-
-	if len(c.UcHosts) > 0 {
-		queryer = NewQueryer(c)
-	}
-
-	return &Uploader{
-		bucket:        c.Bucket,
-		upHosts:       dupStrings(c.UpHosts),
-		credentials:   mac,
-		partSize:      part,
-		upConcurrency: c.UpConcurrency,
-		queryer:       queryer,
-	}
-}
-
-// 根据环境变量创建上传器
-func NewUploaderV2() *Uploader {
-	c := getConf()
-	if c == nil {
-		return nil
-	}
-	return NewUploader(c)
 }
 
 type readerAtCloser interface {

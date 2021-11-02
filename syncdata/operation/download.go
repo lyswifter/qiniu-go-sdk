@@ -35,14 +35,71 @@ var downloadClient = &http.Client{
 
 // 下载器
 type Downloader struct {
+	config                  Configurable
+	singleClusterDownloader *singleClusterDownloader
+}
+
+// 根据配置创建下载器
+func NewDownloader(c *Config) *Downloader {
+	return &Downloader{config: c, singleClusterDownloader: newSingleClusterDownloader(c)}
+}
+
+// 根据环境变量创建下载器
+func NewDownloaderV2() *Downloader {
+	c := getCurrentConfigurable()
+	if c == nil {
+		return nil
+	} else if singleClusterConfig, ok := c.(*Config); ok {
+		return NewDownloader(singleClusterConfig)
+	} else {
+		return &Downloader{config: c}
+	}
+}
+
+// 下载指定对象到文件里
+func (d *Downloader) DownloadFile(key, path string) (f *os.File, err error) {
+	if d.singleClusterDownloader != nil {
+		return d.singleClusterDownloader.downloadFile(key, path)
+	}
+	if config, exists := d.config.forKey(key); !exists {
+		return nil, ErrUndefinedConfig
+	} else {
+		return newSingleClusterDownloader(config).downloadFile(key, path)
+	}
+}
+
+// 下载指定对象到文件里
+func (d *Downloader) DownloadBytes(key string) (data []byte, err error) {
+	if d.singleClusterDownloader != nil {
+		return d.singleClusterDownloader.downloadBytes(key)
+	}
+	if config, exists := d.config.forKey(key); !exists {
+		return nil, ErrUndefinedConfig
+	} else {
+		return newSingleClusterDownloader(config).downloadBytes(key)
+	}
+}
+
+// 下载指定对象的指定范围到内存中
+func (d *Downloader) DownloadRangeBytes(key string, offset, size int64) (l int64, data []byte, err error) {
+	if d.singleClusterDownloader != nil {
+		return d.singleClusterDownloader.downloadRangeBytes(key, offset, size)
+	}
+	if config, exists := d.config.forKey(key); !exists {
+		return 0, nil, ErrUndefinedConfig
+	} else {
+		return newSingleClusterDownloader(config).downloadRangeBytes(key, offset, size)
+	}
+}
+
+type singleClusterDownloader struct {
 	bucket      string
 	ioHosts     []string
 	credentials *qbox.Mac
 	queryer     *Queryer
 }
 
-// 根据配置创建下载器
-func NewDownloader(c *Config) *Downloader {
+func newSingleClusterDownloader(c *Config) *singleClusterDownloader {
 	mac := qbox.NewMac(c.Ak, c.Sk)
 
 	var queryer *Queryer = nil
@@ -51,7 +108,7 @@ func NewDownloader(c *Config) *Downloader {
 		queryer = NewQueryer(c)
 	}
 
-	downloader := Downloader{
+	downloader := singleClusterDownloader{
 		bucket:      c.Bucket,
 		ioHosts:     dupStrings(c.IoHosts),
 		credentials: mac,
@@ -61,17 +118,7 @@ func NewDownloader(c *Config) *Downloader {
 	return &downloader
 }
 
-// 根据环境变量创建下载器
-func NewDownloaderV2() *Downloader {
-	c := getConf()
-	if c == nil {
-		return nil
-	}
-	return NewDownloader(c)
-}
-
-// 下载指定对象到文件里
-func (d *Downloader) DownloadFile(key, path string) (f *os.File, err error) {
+func (d *singleClusterDownloader) downloadFile(key, path string) (f *os.File, err error) {
 	failedIoHosts := make(map[string]struct{})
 	for i := 0; i < 3; i++ {
 		f, err = d.downloadFileInner(key, path, failedIoHosts)
@@ -82,8 +129,7 @@ func (d *Downloader) DownloadFile(key, path string) (f *os.File, err error) {
 	return
 }
 
-// 下载指定对象到文件里
-func (d *Downloader) DownloadBytes(key string) (data []byte, err error) {
+func (d *singleClusterDownloader) downloadBytes(key string) (data []byte, err error) {
 	failedIoHosts := make(map[string]struct{})
 	for i := 0; i < 3; i++ {
 		data, err = d.downloadBytesInner(key, failedIoHosts)
@@ -94,8 +140,7 @@ func (d *Downloader) DownloadBytes(key string) (data []byte, err error) {
 	return
 }
 
-// 下载指定对象的指定范围到内存中
-func (d *Downloader) DownloadRangeBytes(key string, offset, size int64) (l int64, data []byte, err error) {
+func (d *singleClusterDownloader) downloadRangeBytes(key string, offset, size int64) (l int64, data []byte, err error) {
 	failedIoHosts := make(map[string]struct{})
 	for i := 0; i < 3; i++ {
 		l, data, err = d.downloadRangeBytesInner(key, offset, size, failedIoHosts)
@@ -106,19 +151,9 @@ func (d *Downloader) DownloadRangeBytes(key string, offset, size int64) (l int64
 	return
 }
 
-// fileExists checks if a file exists and is not a directory before we
-// try using it to prevent further errors.
-func fileExists(filename string) bool {
-	info, err := os.Stat(filename)
-	if os.IsNotExist(err) {
-		return false
-	}
-	return !info.IsDir()
-}
-
 var curIoHostIndex uint32 = 0
 
-func (d *Downloader) nextHost(failedHosts map[string]struct{}) string {
+func (d *singleClusterDownloader) nextHost(failedHosts map[string]struct{}) string {
 	ioHosts := d.ioHosts
 	if d.queryer != nil {
 		if hosts := d.queryer.QueryIoHosts(false); len(hosts) > 0 {
@@ -144,7 +179,7 @@ func (d *Downloader) nextHost(failedHosts map[string]struct{}) string {
 	}
 }
 
-func (d *Downloader) downloadFileInner(key, path string, failedIoHosts map[string]struct{}) (*os.File, error) {
+func (d *singleClusterDownloader) downloadFileInner(key, path string, failedIoHosts map[string]struct{}) (*os.File, error) {
 	key = strings.TrimPrefix(key, "/")
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
 	if err != nil {
@@ -201,7 +236,7 @@ func (d *Downloader) downloadFileInner(key, path string, failedIoHosts map[strin
 	return f, nil
 }
 
-func (d *Downloader) downloadBytesInner(key string, failedIoHosts map[string]struct{}) ([]byte, error) {
+func (d *singleClusterDownloader) downloadBytesInner(key string, failedIoHosts map[string]struct{}) ([]byte, error) {
 	key = strings.TrimPrefix(key, "/")
 	host := d.nextHost(failedIoHosts)
 
@@ -235,7 +270,7 @@ func generateRange(offset, size int64) string {
 	return fmt.Sprintf("bytes=%d-%d", offset, offset+size)
 }
 
-func (d *Downloader) downloadRangeBytesInner(key string, offset, size int64, failedIoHosts map[string]struct{}) (int64, []byte, error) {
+func (d *singleClusterDownloader) downloadRangeBytesInner(key string, offset, size int64, failedIoHosts map[string]struct{}) (int64, []byte, error) {
 	key = strings.TrimPrefix(key, "/")
 	host := d.nextHost(failedIoHosts)
 

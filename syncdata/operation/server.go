@@ -65,8 +65,15 @@ func (s *server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) listStat(w http.ResponseWriter, r *http.Request) {
-	ret := s.lister.batchStat(r.Body)
-	if ret == nil {
+	var keys []string
+	if err := json.NewDecoder(r.Body).Decode(&keys); err != nil {
+		log.Println("json decode error", err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
+	}
+	ret, err := s.lister.listStat(r.Context(), keys)
+	if err != nil {
+		log.Println("list stats error", err)
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
