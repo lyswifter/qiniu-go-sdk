@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -224,6 +225,7 @@ func (l *Lister) listPrefix(ctx context.Context, prefix string) ([]string, error
 		return nil
 	})
 	err := pool.Wait(ctx)
+	sort.Strings(allKeys) // 对所有 key 排序，模拟从一个集群的效果
 	return allKeys, err
 }
 
