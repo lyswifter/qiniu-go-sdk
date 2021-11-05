@@ -56,6 +56,7 @@ func NewListerV2() *Lister {
 type FileStat struct {
 	Name string `json:"name"`
 	Size int64  `json:"size"`
+	code int    `json:"-"`
 }
 
 // 重命名对象
@@ -434,15 +435,21 @@ func (l *singleClusterLister) delete(key string) error {
 }
 
 func (l *singleClusterLister) listStat(ctx context.Context, paths []string) ([]*FileStat, error) {
+	return l.listStatWithRetries(ctx, paths, 10, 0)
+}
+
+func (l *singleClusterLister) listStatWithRetries(ctx context.Context, paths []string, retries, retried uint) ([]*FileStat, error) {
 	concurrency := (len(paths) + l.batchSize - 1) / l.batchSize
 	if concurrency > l.batchConcurrency {
 		concurrency = l.batchConcurrency
 	}
 	var (
-		stats             = make([]*FileStat, len(paths))
-		failedRsHosts     = make(map[string]struct{})
-		failedRsHostsLock sync.RWMutex
-		pool              = newGoroutinePool(concurrency)
+		stats              = make([]*FileStat, len(paths))
+		failedPath         []string
+		failedPathIndexMap []int
+		failedRsHosts      = make(map[string]struct{})
+		failedRsHostsLock  sync.RWMutex
+		pool               = newGoroutinePool(concurrency)
 	)
 
 	for i := 0; i < len(paths); i += l.batchSize {
@@ -483,18 +490,41 @@ func (l *singleClusterLister) listStat(ctx context.Context, paths []string) ([]*
 				}
 				for j, v := range r {
 					if v.Code != 200 {
-						stats[index+j] = &FileStat{Name: paths[j], Size: -1}
+						stats[index+j] = &FileStat{Name: paths[j], Size: -1, code: v.Code}
 						elog.Warn("stat bad file:", paths[j], "with code:", v.Code)
 					} else {
-						stats[index+j] = &FileStat{Name: paths[j], Size: v.Data.Fsize}
+						stats[index+j] = &FileStat{Name: paths[j], Size: v.Data.Fsize, code: v.Code}
 					}
 				}
 				return nil
 			})
 		}(paths[i:i+size], i)
 	}
-	err := pool.Wait(ctx)
-	return stats, err
+	if err := pool.Wait(ctx); err != nil {
+		return nil, err
+	}
+
+	if retries > 0 {
+		for i, stat := range stats {
+			if stat.code/100 == 5 {
+				failedPathIndexMap = append(failedPathIndexMap, i)
+				failedPath = append(failedPath, stat.Name)
+				elog.Warn("restat bad file:", stat.Name, "with code:", stat.code)
+			}
+		}
+		if len(failedPath) > 0 {
+			elog.Warn("restat ", len(failedPath), " bad files, retried:", retried)
+			retriedStats, err := l.listStatWithRetries(ctx, failedPath, retries-1, retried+1)
+			if err != nil {
+				return stats, err
+			}
+			for i, retriedStat := range retriedStats {
+				stats[failedPathIndexMap[i]] = retriedStat
+			}
+		}
+	}
+
+	return stats, nil
 }
 
 func (l *singleClusterLister) listPrefix(ctx context.Context, prefix string) ([]string, error) {
