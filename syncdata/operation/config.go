@@ -18,6 +18,7 @@ type Config struct {
 	UpHosts          []string `json:"up_hosts" toml:"up_hosts"`
 	RsHosts          []string `json:"rs_hosts" toml:"rs_hosts"`
 	RsfHosts         []string `json:"rsf_hosts" toml:"rsf_hosts"`
+	ApiServerHosts   []string `json:"api_server_hosts" toml:"api_server_hosts"`
 	Bucket           string   `json:"bucket" toml:"bucket"`
 	Ak               string   `json:"ak" toml:"ak"`
 	Sk               string   `json:"sk" toml:"sk"`
@@ -37,8 +38,8 @@ type Config struct {
 	originalPath string `json:"-" toml:"-"`
 }
 
-func (config *Config) forEachClusterConfig(f func(*Config) error) error {
-	return f(config)
+func (config *Config) forEachClusterConfig(f func(string, *Config) error) error {
+	return f(DefaultPathPrefix, config)
 }
 
 func (config *Config) forKey(key string) (*Config, bool) {

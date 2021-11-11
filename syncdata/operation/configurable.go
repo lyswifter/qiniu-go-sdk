@@ -7,7 +7,7 @@ import (
 
 type Configurable interface {
 	forKey(string) (*Config, bool)
-	forEachClusterConfig(func(*Config) error) error
+	forEachClusterConfig(func(string, *Config) error) error
 	getOriginalPaths() []string
 }
 

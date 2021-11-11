@@ -212,7 +212,7 @@ func (l *Lister) listPrefix(ctx context.Context, prefix string) ([]string, error
 	pool := newGoroutinePool(l.multiClustersConcurrency)
 	allKeys := make([]string, 0)
 	var allKeysMutex sync.Mutex
-	l.config.forEachClusterConfig(func(config *Config) error {
+	l.config.forEachClusterConfig(func(_ string, config *Config) error {
 		pool.Go(func(ctx context.Context) error {
 			if keys, err := l.listPrefixForConfig(ctx, config, prefix); err != nil {
 				return err

@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -59,11 +61,12 @@ type (
 	}
 
 	cachedHost struct {
-		Ttl int64                `json:"ttl"`
-		Io  cachedServiceDomains `json:"io"`
-		Up  cachedServiceDomains `json:"up"`
-		Rs  cachedServiceDomains `json:"rs"`
-		Rsf cachedServiceDomains `json:"rsf"`
+		Ttl       int64                `json:"ttl"`
+		Io        cachedServiceDomains `json:"io"`
+		Up        cachedServiceDomains `json:"up"`
+		Rs        cachedServiceDomains `json:"rs"`
+		Rsf       cachedServiceDomains `json:"rsf"`
+		ApiServer cachedServiceDomains `json:"api"`
 	}
 
 	cachedServiceDomains struct {
@@ -117,6 +120,15 @@ func (queryer *Queryer) QueryRsHosts(https bool) (urls []string) {
 func (queryer *Queryer) QueryRsfHosts(https bool) (urls []string) {
 	if cache, err := queryer.query(); err == nil {
 		domains := cache.CachedHosts.Hosts[0].Rsf.Domains
+		urls = queryer.fromDomainsToUrls(https, domains)
+	}
+	return
+}
+
+// 查询 APISERVER 服务器 URL
+func (queryer *Queryer) QueryApiServerHosts(https bool) (urls []string) {
+	if cache, err := queryer.query(); err == nil {
+		domains := cache.CachedHosts.Hosts[0].ApiServer.Domains
 		urls = queryer.fromDomainsToUrls(https, domains)
 	}
 	return
@@ -255,7 +267,11 @@ func (queryer *Queryer) setCache(c *cache) {
 }
 
 func (queryer *Queryer) cacheKey() string {
-	return fmt.Sprintf("%s:%s", queryer.bucket, queryer.ak)
+	ucHosts := dupStrings(queryer.ucHosts)
+	sort.Strings(ucHosts)
+	serializedUcHosts := strings.Join(ucHosts, "$")
+	hostsCrc32 := crc32.ChecksumIEEE([]byte(serializedUcHosts))
+	return fmt.Sprintf("cache-key-v2:%s:%s:%d", queryer.ak, queryer.bucket, hostsCrc32)
 }
 
 var curUcHostIndex uint32 = 0
@@ -307,7 +323,9 @@ func loadQueryersCache() error {
 	}
 
 	for key, value := range m {
-		cacheMap.Store(key, value)
+		if strings.HasPrefix(key, "cache-key-v2:") {
+			cacheMap.Store(key, value)
+		}
 	}
 	return nil
 }

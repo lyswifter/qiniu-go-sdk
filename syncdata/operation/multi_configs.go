@@ -26,9 +26,9 @@ func (multiConfigs *MultiClustersConfig) SetConfigSelectCallback(f func(map[stri
 	multiConfigs.selectConfigCallbackRwLock.Unlock()
 }
 
-func (multiConfigs *MultiClustersConfig) forEachClusterConfig(f func(*Config) error) error {
-	for _, config := range multiConfigs.configs {
-		if err := f(config); err != nil {
+func (multiConfigs *MultiClustersConfig) forEachClusterConfig(f func(string, *Config) error) error {
+	for pathPrefix, config := range multiConfigs.configs {
+		if err := f(pathPrefix, config); err != nil {
 			return err
 		}
 	}
