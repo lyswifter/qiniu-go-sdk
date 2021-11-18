@@ -272,7 +272,6 @@ func (r Client) CallWithForm(
 		log.Println("error is ", err)
 		return err
 	}
-	log.Println("ret code", resp.StatusCode)
 	return CallRet(ctx, ret, resp)
 }
 
