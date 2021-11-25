@@ -132,7 +132,6 @@ func (p *singleClusterUploader) uploadData(data []byte, key string) (err error) 
 	defer func() {
 		elog.Info("up time ", key, time.Now().Sub(t))
 	}()
-	key = strings.TrimPrefix(key, "/")
 	policy := kodo.PutPolicy{
 		Scope:   p.bucket + ":" + key,
 		Expires: 3600*24 + uint32(time.Now().Unix()),
@@ -167,7 +166,6 @@ func (p *singleClusterUploader) uploadDataReader(data io.ReaderAt, size int, key
 	defer func() {
 		elog.Info("up time ", key, time.Now().Sub(t))
 	}()
-	key = strings.TrimPrefix(key, "/")
 	policy := kodo.PutPolicy{
 		Scope:   p.bucket + ":" + key,
 		Expires: 3600*24 + uint32(time.Now().Unix()),
@@ -203,7 +201,6 @@ func (p *singleClusterUploader) upload(file string, key string) (err error) {
 	defer func() {
 		elog.Info("up time ", key, time.Now().Sub(t))
 	}()
-	key = strings.TrimPrefix(key, "/")
 	policy := kodo.PutPolicy{
 		Scope:   p.bucket + ":" + key,
 		Expires: 3600*24 + uint32(time.Now().Unix()),
@@ -265,7 +262,7 @@ func (p *singleClusterUploader) uploadReader(reader io.Reader, key string) (err 
 	defer func() {
 		elog.Info("up time ", key, time.Now().Sub(t))
 	}()
-	key = strings.TrimPrefix(key, "/")
+	
 	policy := kodo.PutPolicy{
 		Scope:   p.bucket + ":" + key,
 		Expires: 3600*24 + uint32(time.Now().Unix()),
