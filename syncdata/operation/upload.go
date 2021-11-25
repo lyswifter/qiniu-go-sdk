@@ -8,7 +8,6 @@ import (
 	"io"
 	"io/ioutil"
 	"os"
-	"strings"
 	"time"
 
 	"github.com/qiniupd/qiniu-go-sdk/api.v7/auth/qbox"
