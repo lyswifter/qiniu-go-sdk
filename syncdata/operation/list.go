@@ -187,7 +187,7 @@ func (l *Lister) listStat(ctx context.Context, keys []string) ([]*FileStat, erro
 			})
 		}(config, keysWithIndex.Keys, keysWithIndex.IndexMap)
 	}
-	err := pool.Wait(context.Background())
+	err := pool.Wait(ctx)
 	return allStats, err
 }
 
