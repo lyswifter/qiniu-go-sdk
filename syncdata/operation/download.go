@@ -399,7 +399,7 @@ func (d *singleClusterDownloader) downloadCheckInner(key, host string) (f *FileS
 	if err != nil {
 		return &FileStat{
 			Name: key,
-			Size: 0,
+			Size: -1,
 			code: PathError,
 		}, err
 	}
@@ -410,7 +410,7 @@ func (d *singleClusterDownloader) downloadCheckInner(key, host string) (f *FileS
 	if err != nil {
 		return &FileStat{
 			Name: key,
-			Size: 0,
+			Size: -1,
 			code: HostError,
 		}, err
 	}
@@ -426,7 +426,7 @@ func (d *singleClusterDownloader) downloadCheckInner(key, host string) (f *FileS
 	if response.StatusCode == http.StatusNotFound {
 		return &FileStat{
 			Name: key,
-			Size: 0,
+			Size: -1,
 			code: FileError,
 		}, os.ErrNotExist
 	}
