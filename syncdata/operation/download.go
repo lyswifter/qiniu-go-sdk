@@ -221,11 +221,10 @@ func (d *singleClusterDownloader) downloadRangeBytes(key string, offset, size in
 func (d *singleClusterDownloader) downloadCheckList(ctx context.Context, keys []string) ([]*FileStat, error) {
 	concurrency := runtime.NumCPU()
 	var (
-		length            = len(keys)
-		stats             = make([]*FileStat, length)
-		index             = 0
-		indexLock         sync.Mutex
-		failedIoHosts     = make(map[string]struct{})
+		length                  = len(keys)
+		stats                   = make([]*FileStat, length)
+		index             int32 = 0
+		failedIoHosts           = make(map[string]struct{})
 		failedIoHostsLock sync.RWMutex
 		pool              = newGoroutinePool(concurrency)
 	)
@@ -233,10 +232,7 @@ func (d *singleClusterDownloader) downloadCheckList(ctx context.Context, keys []
 	for i := 0; i < concurrency; i++ {
 		pool.Go(func(ctx context.Context) error {
 			for {
-				indexLock.Lock()
-				pos := index
-				index++
-				indexLock.Unlock()
+				pos := int(atomic.AddInt32(&index, 1) - 1)
 				if pos >= length {
 					return nil
 				}
