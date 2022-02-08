@@ -315,12 +315,11 @@ func (d *singleClusterDownloader) downloadFileInner(key, path string, failedIoHo
 			return nil, err
 		}
 	} else if !os.IsNotExist(err) {
-		fmt.Println("open file failed", err)
+		elog.Warn("open file error", err)
 		return nil, err
 	}
 	host := d.nextHost(failedIoHosts)
 
-	fmt.Println("remote path", key)
 	url := fmt.Sprintf("%s/getfile/%s/%s/%s", host, d.credentials.AccessKey, d.bucket, key)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -333,7 +332,7 @@ func (d *singleClusterDownloader) downloadFileInner(key, path string, failedIoHo
 	if length != 0 {
 		r := fmt.Sprintf("bytes=%d-", length)
 		req.Header.Set("Range", r)
-		fmt.Println("continue download")
+		elog.Info("continue download")
 	}
 
 	response, err := downloadClient.Do(req)
@@ -361,10 +360,6 @@ func (d *singleClusterDownloader) downloadFileInner(key, path string, failedIoHo
 		}
 	}
 
-	_, err = f.Seek(0, io.SeekEnd)
-	if err != nil {
-		return nil, err
-	}
 	n, err := io.Copy(f, response.Body)
 	if err != nil {
 		return nil, err
