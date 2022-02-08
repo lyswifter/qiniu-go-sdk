@@ -300,20 +300,23 @@ func (d *singleClusterDownloader) nextHost(failedHosts map[string]struct{}) stri
 // try using it to prevent further errors.
 func fileExists(filename string) bool {
 	_, err := os.Stat(filename)
-	return  err == nil || os.IsExist(err)
+	return err == nil || os.IsExist(err)
 }
 
 func (d *singleClusterDownloader) downloadFileInner(key, path string, failedIoHosts map[string]struct{}) (*os.File, error) {
 	key = strings.TrimPrefix(key, "/")
-	info, err := os.Stat(path)
 	var length int64 = 0
 	var f *os.File
+	var err error
+	f, err = os.OpenFile(path, os.O_RDWR, 0644)
 	if err == nil {
-		length = info.Size()
-		f, err = os.OpenFile(path, os.O_RDWR, 0644)
+		length, err = f.Seek(0, io.SeekEnd)
 		if err != nil {
 			return nil, err
 		}
+	} else if !os.IsNotExist(err) {
+		fmt.Println("open file failed", err)
+		return nil, err
 	}
 	host := d.nextHost(failedIoHosts)
 
