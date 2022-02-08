@@ -296,15 +296,24 @@ func (d *singleClusterDownloader) nextHost(failedHosts map[string]struct{}) stri
 	}
 }
 
+// fileExists checks if a file exists and is not a directory before we
+// try using it to prevent further errors.
+func fileExists(filename string) bool {
+	_, err := os.Stat(filename)
+	return  err == nil || os.IsExist(err)
+}
+
 func (d *singleClusterDownloader) downloadFileInner(key, path string, failedIoHosts map[string]struct{}) (*os.File, error) {
 	key = strings.TrimPrefix(key, "/")
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		return nil, err
-	}
-	length, err := f.Seek(0, io.SeekEnd)
-	if err != nil {
-		return nil, err
+	info, err := os.Stat(path)
+	var length int64 = 0
+	var f *os.File
+	if err == nil {
+		length = info.Size()
+		f, err = os.OpenFile(path, os.O_RDWR, 0644)
+		if err != nil {
+			return nil, err
+		}
 	}
 	host := d.nextHost(failedIoHosts)
 
@@ -342,6 +351,17 @@ func (d *singleClusterDownloader) downloadFileInner(key, path string, failedIoHo
 	}
 	succeedHostName(host)
 	ctLength := response.ContentLength
+	if f == nil {
+		f, err = os.OpenFile(path, os.O_CREATE, 0644)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	_, err = f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return nil, err
+	}
 	n, err := io.Copy(f, response.Body)
 	if err != nil {
 		return nil, err
