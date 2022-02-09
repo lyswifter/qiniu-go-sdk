@@ -296,19 +296,30 @@ func (d *singleClusterDownloader) nextHost(failedHosts map[string]struct{}) stri
 	}
 }
 
+// fileExists checks if a file exists and is not a directory before we
+// try using it to prevent further errors.
+func fileExists(filename string) bool {
+	_, err := os.Stat(filename)
+	return err == nil || os.IsExist(err)
+}
+
 func (d *singleClusterDownloader) downloadFileInner(key, path string, failedIoHosts map[string]struct{}) (*os.File, error) {
 	key = strings.TrimPrefix(key, "/")
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		return nil, err
-	}
-	length, err := f.Seek(0, io.SeekEnd)
-	if err != nil {
+	var length int64 = 0
+	var f *os.File
+	var err error
+	f, err = os.OpenFile(path, os.O_RDWR, 0644)
+	if err == nil {
+		length, err = f.Seek(0, io.SeekEnd)
+		if err != nil {
+			return nil, err
+		}
+	} else if !os.IsNotExist(err) {
+		elog.Warn("open file error", err)
 		return nil, err
 	}
 	host := d.nextHost(failedIoHosts)
 
-	fmt.Println("remote path", key)
 	url := fmt.Sprintf("%s/getfile/%s/%s/%s", host, d.credentials.AccessKey, d.bucket, key)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
@@ -321,7 +332,7 @@ func (d *singleClusterDownloader) downloadFileInner(key, path string, failedIoHo
 	if length != 0 {
 		r := fmt.Sprintf("bytes=%d-", length)
 		req.Header.Set("Range", r)
-		fmt.Println("continue download")
+		elog.Info("continue download")
 	}
 
 	response, err := downloadClient.Do(req)
@@ -342,6 +353,13 @@ func (d *singleClusterDownloader) downloadFileInner(key, path string, failedIoHo
 	}
 	succeedHostName(host)
 	ctLength := response.ContentLength
+	if f == nil {
+		f, err = os.OpenFile(path, os.O_CREATE, 0644)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	n, err := io.Copy(f, response.Body)
 	if err != nil {
 		return nil, err
