@@ -525,14 +525,12 @@ func (d *singleClusterDownloader) downloadRangeBytesInner(key string, offset, si
 type wrapper struct {
 	s io.ReadCloser
 	host string
-	failedIoHosts map[string]struct{}
 }
 
 func (w *wrapper) Read(p []byte) (n int, err error) {
 	n, err = w.s.Read(p)
 	if err != nil && err != io.EOF{
-		w.failedIoHosts[w.host] = struct{}{}
-		failHostName(w.host)
+		elog.Info("read interrupt", w.host, err)
 	}
 	return
 }
@@ -588,7 +586,6 @@ func (d *singleClusterDownloader) downloadRangeReaderInner(key string, offset, s
 	w := wrapper{
 		s:             response.Body,
 		host:          host,
-		failedIoHosts: failedIoHosts,
 	}
 	return l, &w, err
 }
