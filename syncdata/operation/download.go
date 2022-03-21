@@ -159,6 +159,18 @@ func (d *Downloader) DownloadRangeBytes(key string, offset, size int64) (l int64
 	}
 }
 
+// 下载指定对象的指定范围为Reader
+func (d *Downloader) DownloadRangeReader(key string, offset, size int64) (l int64, reader io.ReadCloser, err error) {
+	if d.singleClusterDownloader != nil {
+		return d.singleClusterDownloader.downloadRangeReader(key, offset, size)
+	}
+	if config, exists := d.config.forKey(key); !exists {
+		return 0, nil, ErrUndefinedConfig
+	} else {
+		return newSingleClusterDownloader(config).downloadRangeReader(key, offset, size)
+	}
+}
+
 type singleClusterDownloader struct {
 	bucket      string
 	ioHosts     []string
@@ -211,6 +223,17 @@ func (d *singleClusterDownloader) downloadRangeBytes(key string, offset, size in
 	failedIoHosts := make(map[string]struct{})
 	for i := 0; i < 3; i++ {
 		l, data, err = d.downloadRangeBytesInner(key, offset, size, failedIoHosts)
+		if err == nil {
+			break
+		}
+	}
+	return
+}
+
+func (d *singleClusterDownloader) downloadRangeReader(key string, offset, size int64) (l int64, reader io.ReadCloser, err error) {
+	failedIoHosts := make(map[string]struct{})
+	for i := 0; i < 3; i++ {
+		l, reader, err = d.downloadRangeReaderInner(key, offset, size, failedIoHosts)
 		if err == nil {
 			break
 		}
@@ -490,6 +513,36 @@ func (d *singleClusterDownloader) downloadCheckInner(key, host string) (f *FileS
 }
 
 func (d *singleClusterDownloader) downloadRangeBytesInner(key string, offset, size int64, failedIoHosts map[string]struct{}) (int64, []byte, error) {
+	l, r, err := d.downloadRangeReaderInner(key, offset, size, failedIoHosts)
+	if err != nil {
+		return l, nil, err
+	}
+	b, err := ioutil.ReadAll(r)
+	r.Close()
+	return l, b, err
+}
+
+type wrapper struct {
+	s io.ReadCloser
+	host string
+	failedIoHosts map[string]struct{}
+}
+
+func (w *wrapper) Read(p []byte) (n int, err error) {
+	n, err = w.s.Read(p)
+	if err != nil && err != io.EOF{
+		w.failedIoHosts[w.host] = struct{}{}
+		failHostName(w.host)
+	}
+	return
+}
+
+func (w *wrapper) Close() error  {
+	return w.s.Close()
+}
+
+
+func (d *singleClusterDownloader) downloadRangeReaderInner(key string, offset, size int64, failedIoHosts map[string]struct{}) (int64, io.ReadCloser, error) {
 	key = strings.TrimPrefix(key, "/")
 	host := d.nextHost(failedIoHosts)
 
@@ -509,11 +562,11 @@ func (d *singleClusterDownloader) downloadRangeBytesInner(key string, offset, si
 		failHostName(host)
 		return -1, nil, err
 	}
-	defer response.Body.Close()
 
 	if response.StatusCode != http.StatusPartialContent {
 		failedIoHosts[host] = struct{}{}
 		failHostName(host)
+		response.Body.Close()
 		return -1, nil, errors.New(response.Status)
 	}
 
@@ -521,6 +574,7 @@ func (d *singleClusterDownloader) downloadRangeBytesInner(key string, offset, si
 	if rangeResponse == "" {
 		failedIoHosts[host] = struct{}{}
 		failHostName(host)
+		response.Body.Close()
 		return -1, nil, errors.New("no content range")
 	}
 
@@ -528,16 +582,15 @@ func (d *singleClusterDownloader) downloadRangeBytesInner(key string, offset, si
 	if err != nil {
 		failedIoHosts[host] = struct{}{}
 		failHostName(host)
+		response.Body.Close()
 		return -1, nil, err
 	}
-	b, err := ioutil.ReadAll(response.Body)
-	if err != nil {
-		failedIoHosts[host] = struct{}{}
-		failHostName(host)
-	} else {
-		succeedHostName(host)
+	w := wrapper{
+		s:             response.Body,
+		host:          host,
+		failedIoHosts: failedIoHosts,
 	}
-	return l, b, err
+	return l, &w, err
 }
 
 func getTotalLength(crange string) (int64, error) {
