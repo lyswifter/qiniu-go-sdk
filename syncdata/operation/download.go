@@ -408,7 +408,6 @@ func (d *singleClusterDownloader) downloadFileInner(key, path string, failedIoHo
 	if response.StatusCode != http.StatusOK && response.StatusCode != http.StatusPartialContent {
 		failedIoHosts[host] = struct{}{}
 		failHostName(host)
-		response.Body.Close()
 		return nil, errors.New(response.Status)
 	}
 	succeedHostName(host)
@@ -416,7 +415,6 @@ func (d *singleClusterDownloader) downloadFileInner(key, path string, failedIoHo
 	if f == nil {
 		f, err = os.OpenFile(path, os.O_CREATE, 0644)
 		if err != nil {
-			response.Body.Close()
 			return nil, err
 		}
 	}
@@ -442,7 +440,6 @@ func (d *singleClusterDownloader) downloadBytesInner(key string, failedIoHosts m
 	if response.StatusCode != http.StatusOK {
 		failedIoHosts[host] = struct{}{}
 		failHostName(host)
-		response.Body.Close()
 		return nil, errors.New(response.Status)
 	}
 	succeedHostName(host)
