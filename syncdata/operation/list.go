@@ -234,6 +234,62 @@ func (l *Lister) listPrefixForConfig(ctx context.Context, config *Config, prefix
 	return newSingleClusterLister(config).listPrefix(ctx, prefix)
 }
 
+// 删除多个对象
+func (l *Lister) DeleteKeys(keys []string) ([]*DeleteKeysError, error) {
+	return l.deleteKeys(context.Background(), keys)
+}
+
+func (l *Lister) deleteKeys(ctx context.Context, keys []string) ([]*DeleteKeysError, error) {
+	if l.singleClusterLister != nil {
+		return l.singleClusterLister.deleteKeys(ctx, keys)
+	}
+
+	type KeysWithIndex struct {
+		IndexMap []int
+		Keys     []string
+	}
+
+	clusterPathsMap := make(map[*Config]*KeysWithIndex)
+	for i, key := range keys {
+		config, exists := l.config.forKey(key)
+		if !exists {
+			return nil, ErrUndefinedConfig
+		}
+		if keysWithIndex := clusterPathsMap[config]; keysWithIndex != nil {
+			keysWithIndex.IndexMap = append(keysWithIndex.IndexMap, i)
+			keysWithIndex.Keys = append(keysWithIndex.Keys, key)
+		} else {
+			keysWithIndex = &KeysWithIndex{Keys: make([]string, 0, 1), IndexMap: make([]int, 0, 1)}
+			keysWithIndex.IndexMap = append(keysWithIndex.IndexMap, i)
+			keysWithIndex.Keys = append(keysWithIndex.Keys, key)
+			clusterPathsMap[config] = keysWithIndex
+		}
+	}
+
+	pool := newGoroutinePool(l.multiClustersConcurrency)
+	allErrors := make([]*DeleteKeysError, len(keys))
+	for config, keysWithIndex := range clusterPathsMap {
+		func(config *Config, keys []string, indexMap []int) {
+			pool.Go(func(ctx context.Context) error {
+				if errors, err := l.deleteKeysForConfig(ctx, config, keys); err != nil {
+					return err
+				} else {
+					for i := range errors {
+						allErrors[indexMap[i]] = errors[i]
+					}
+					return nil
+				}
+			})
+		}(config, keysWithIndex.Keys, keysWithIndex.IndexMap)
+	}
+	err := pool.Wait(ctx)
+	return allErrors, err
+}
+
+func (l *Lister) deleteKeysForConfig(ctx context.Context, config *Config, keys []string) ([]*DeleteKeysError, error) {
+	return newSingleClusterLister(config).deleteKeys(ctx, keys)
+}
+
 func newSingleClusterLister(c *Config) *singleClusterLister {
 	mac := qbox.NewMac(c.Ak, c.Sk)
 
@@ -527,6 +583,105 @@ func (l *singleClusterLister) listStatWithRetries(ctx context.Context, paths []s
 	}
 
 	return stats, nil
+}
+
+func (l *singleClusterLister) deleteKeys(ctx context.Context, keys []string) ([]*DeleteKeysError, error) {
+	return l.deleteKeysWithRetries(ctx, keys, 10, 0)
+}
+
+func (l *singleClusterLister) deleteKeysWithRetries(ctx context.Context, paths []string, retries, retried uint) ([]*DeleteKeysError, error) {
+	concurrency := (len(paths) + l.batchSize - 1) / l.batchSize
+	if concurrency > l.batchConcurrency {
+		concurrency = l.batchConcurrency
+	}
+	var (
+		errors             = make([]*DeleteKeysError, len(paths))
+		failedPath         []string
+		failedPathIndexMap []int
+		failedRsHosts      = make(map[string]struct{})
+		failedRsHostsLock  sync.RWMutex
+		pool               = newGoroutinePool(concurrency)
+	)
+
+	for i := 0; i < len(paths); i += l.batchSize {
+		size := l.batchSize
+		if size > len(paths)-i {
+			size = len(paths) - i
+		}
+		func(paths []string, index int) {
+			pool.Go(func(ctx context.Context) error {
+				failedRsHostsLock.RLock()
+				host := l.nextRsHost(failedRsHosts)
+				failedRsHostsLock.RUnlock()
+				bucket := l.newBucket(host, "")
+				r, err := bucket.BatchDelete(ctx, paths...)
+				if err != nil {
+					failedRsHostsLock.Lock()
+					failedRsHosts[host] = struct{}{}
+					failedRsHostsLock.Unlock()
+					failHostName(host)
+					elog.Info("batchDelete retry 0", host, err)
+					failedRsHostsLock.RLock()
+					host = l.nextRsHost(failedRsHosts)
+					failedRsHostsLock.RUnlock()
+					bucket = l.newBucket(host, "")
+					r, err = bucket.BatchDelete(ctx, paths...)
+					if err != nil {
+						failedRsHostsLock.Lock()
+						failedRsHosts[host] = struct{}{}
+						failedRsHostsLock.Unlock()
+						failHostName(host)
+						elog.Info("batchDelete retry 1", host, err)
+						return err
+					} else {
+						succeedHostName(host)
+					}
+				} else {
+					succeedHostName(host)
+				}
+				for j, v := range r {
+					if v.Code != 200 {
+						errors[index+j] = &DeleteKeysError{Name: paths[j], Error: v.Error, Code: v.Code}
+						elog.Warn("delete bad file:", paths[j], "with code:", v.Code)
+					} else {
+						errors[index+j] = nil
+					}
+				}
+				return nil
+			})
+		}(paths[i:i+size], i)
+	}
+	if err := pool.Wait(ctx); err != nil {
+		return nil, err
+	}
+
+	if retries > 0 {
+		for i, e := range errors {
+			if e != nil && e.Code/100 == 5 {
+				failedPathIndexMap = append(failedPathIndexMap, i)
+				failedPath = append(failedPath, e.Name)
+				elog.Warn("redelete bad file:", e.Name, "with code:", e.Code)
+			}
+		}
+		if len(failedPath) > 0 {
+			elog.Warn("redelete ", len(failedPath), " bad files, retried:", retried)
+			retriedErrors, err := l.deleteKeysWithRetries(ctx, failedPath, retries-1, retried+1)
+			if err != nil {
+				return errors, err
+			}
+			for i, retriedError := range retriedErrors {
+				errors[failedPathIndexMap[i]] = retriedError
+			}
+		}
+	}
+
+	return errors, nil
+}
+
+type DeleteKeysError struct {
+	Error string
+	Code  int
+	Name  string
 }
 
 func (l *singleClusterLister) listPrefix(ctx context.Context, prefix string) ([]string, error) {
