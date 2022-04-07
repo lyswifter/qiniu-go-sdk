@@ -9,7 +9,7 @@ import (
 	"github.com/qiniupd/qiniu-go-sdk/x/rpc.v7"
 )
 
-var version = "1.2.0"
+var version = "1.3.0"
 
 var ACCESS_KEY string
 var SECRET_KEY string
