@@ -35,6 +35,9 @@ type Config struct {
 	IoHosts []string `json:"io_hosts" toml:"io_hosts"`
 	UcHosts []string `json:"uc_hosts" toml:"uc_hosts"`
 
+	RecycleBin          string `json:"recycle_bin" toml:"recycle_bin"`
+	AutoDeleteAfterDays int    `json:"auto_delete_after_days" toml:"auto_delete_after_days"`
+
 	originalPath string `json:"-" toml:"-"`
 }
 

@@ -59,6 +59,16 @@ func (p Bucket) Delete(ctx context.Context, key string) (err error) {
 	return p.Conn.Call(ctx, nil, "POST", p.Conn.RSHost+URIDelete(p.Name, key))
 }
 
+// 设置文件过期删除时间
+//
+// ctx 是请求的上下文。
+// key 是要设置的文件的访问路径。
+// afterDays 过期删除时间，0 表示取消。
+//
+func (p Bucket) DeleteAfterDays(ctx context.Context, key string, deleteAfterDays int) (err error) {
+	return p.Conn.Call(ctx, nil, "POST", p.Conn.RSHost+URIDeleteAfterDays(p.Name, key, deleteAfterDays))
+}
+
 // 移动一个文件。
 //
 // ctx     是请求的上下文。
@@ -67,6 +77,16 @@ func (p Bucket) Delete(ctx context.Context, key string) (err error) {
 //
 func (p Bucket) Move(ctx context.Context, keySrc, keyDest string) (err error) {
 	return p.Conn.Call(ctx, nil, "POST", p.Conn.RSHost+URIMove(p.Name, keySrc, p.Name, keyDest))
+}
+
+// 重命名一个文件。
+//
+// ctx     是请求的上下文。
+// keySrc  是要移动的文件的旧路径。
+// keyDest 是要移动的文件的新路径。
+//
+func (p Bucket) Rename(ctx context.Context, keySrc, keyDest string) (err error) {
+	return p.Conn.Call(ctx, nil, "POST", p.Conn.APIHost+URIRename(p.Name, keySrc, p.Name, keyDest))
 }
 
 // 跨空间（bucket）移动一个文件。
@@ -247,8 +267,16 @@ func URIMove(bucketSrc, keySrc, bucketDest, keyDest string) string {
 	return "/move/" + encodeURI(bucketSrc+":"+keySrc) + "/" + encodeURI(bucketDest+":"+keyDest)
 }
 
+func URIRename(bucketSrc, keySrc, bucketDest, keyDest string) string {
+	return "/rename/" + encodeURI(bucketSrc+":"+keySrc) + "/" + encodeURI(bucketDest+":"+keyDest)
+}
+
 func URIChangeMime(bucket, key, mime string) string {
 	return "/chgm/" + encodeURI(bucket+":"+key) + "/mime/" + encodeURI(mime)
+}
+
+func URIDeleteAfterDays(bucket, key string, afterDays int) string {
+	return "/deleteAfterDays/" + encodeURI(bucket+":"+key) + "/" + strconv.Itoa(afterDays)
 }
 
 type FileType uint32
