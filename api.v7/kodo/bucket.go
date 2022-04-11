@@ -59,16 +59,6 @@ func (p Bucket) Delete(ctx context.Context, key string) (err error) {
 	return p.Conn.Call(ctx, nil, "POST", p.Conn.RSHost+URIDelete(p.Name, key))
 }
 
-// 设置文件过期删除时间
-//
-// ctx 是请求的上下文。
-// key 是要设置的文件的访问路径。
-// afterDays 过期删除时间，0 表示取消。
-//
-func (p Bucket) DeleteAfterDays(ctx context.Context, key string, deleteAfterDays int) (err error) {
-	return p.Conn.Call(ctx, nil, "POST", p.Conn.RSHost+URIDeleteAfterDays(p.Name, key, deleteAfterDays))
-}
-
 // 移动一个文件。
 //
 // ctx     是请求的上下文。
@@ -273,10 +263,6 @@ func URIRename(bucketSrc, keySrc, bucketDest, keyDest string) string {
 
 func URIChangeMime(bucket, key, mime string) string {
 	return "/chgm/" + encodeURI(bucket+":"+key) + "/mime/" + encodeURI(mime)
-}
-
-func URIDeleteAfterDays(bucket, key string, afterDays int) string {
-	return "/deleteAfterDays/" + encodeURI(bucket+":"+key) + "/" + strconv.Itoa(afterDays)
 }
 
 type FileType uint32

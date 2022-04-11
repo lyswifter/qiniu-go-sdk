@@ -303,26 +303,22 @@ func newSingleClusterLister(c *Config) *singleClusterLister {
 	}
 
 	lister := singleClusterLister{
-		bucket:              c.Bucket,
-		rsHosts:             dupStrings(c.RsHosts),
-		upHosts:             dupStrings(c.UpHosts),
-		rsfHosts:            dupStrings(c.RsfHosts),
-		apiServerHosts:      dupStrings(c.ApiServerHosts),
-		credentials:         mac,
-		queryer:             queryer,
-		batchConcurrency:    c.BatchConcurrency,
-		batchSize:           c.BatchSize,
-		recycleBin:          c.RecycleBin,
-		autoDeleteAfterDays: c.AutoDeleteAfterDays,
+		bucket:           c.Bucket,
+		rsHosts:          dupStrings(c.RsHosts),
+		upHosts:          dupStrings(c.UpHosts),
+		rsfHosts:         dupStrings(c.RsfHosts),
+		apiServerHosts:   dupStrings(c.ApiServerHosts),
+		credentials:      mac,
+		queryer:          queryer,
+		batchConcurrency: c.BatchConcurrency,
+		batchSize:        c.BatchSize,
+		recycleBin:       c.RecycleBin,
 	}
 	if lister.batchConcurrency <= 0 {
 		lister.batchConcurrency = 20
 	}
 	if lister.batchSize <= 0 {
 		lister.batchSize = 100
-	}
-	if lister.autoDeleteAfterDays < 0 {
-		lister.autoDeleteAfterDays = 0
 	}
 	shuffleHosts(lister.rsHosts)
 	shuffleHosts(lister.rsfHosts)
@@ -332,17 +328,16 @@ func newSingleClusterLister(c *Config) *singleClusterLister {
 }
 
 type singleClusterLister struct {
-	bucket              string
-	rsHosts             []string
-	upHosts             []string
-	rsfHosts            []string
-	apiServerHosts      []string
-	credentials         *qbox.Mac
-	queryer             *Queryer
-	batchSize           int
-	batchConcurrency    int
-	recycleBin          string
-	autoDeleteAfterDays int
+	bucket           string
+	rsHosts          []string
+	upHosts          []string
+	rsfHosts         []string
+	apiServerHosts   []string
+	credentials      *qbox.Mac
+	queryer          *Queryer
+	batchSize        int
+	batchConcurrency int
+	recycleBin       string
 }
 
 var curRsHostIndex uint32 = 0
@@ -579,53 +574,19 @@ func bucketOrObjectIsNotFound(err error) bool {
 	return false
 }
 
-func (l *singleClusterLister) renameAsDelete(ctx context.Context, key string, recycleBin string, autoDeleteAfterDays int) (err error) {
+func (l *singleClusterLister) renameAsDelete(ctx context.Context, key string, recycleBin string) error {
 	keyAfterRename := recycleBin
 	if !strings.HasSuffix(keyAfterRename, "/") {
 		keyAfterRename += "/"
 	}
 	keyAfterRename += key
 	l.deleteAsDelete(ctx, keyAfterRename)
-	if err = l.renameAsRename(ctx, key, keyAfterRename); err != nil {
-		return
-	}
-	if autoDeleteAfterDays > 0 {
-		if err = l.deleteAfterDays(ctx, keyAfterRename, autoDeleteAfterDays); err != nil {
-			return
-		}
-	}
-	return
-}
-
-func (l *singleClusterLister) deleteAfterDays(ctx context.Context, key string, afterDays int) error {
-	failedRsHosts := make(map[string]struct{})
-	host := l.nextRsHost(failedRsHosts)
-	bucket := l.newBucket(host, "", "")
-	err := bucket.DeleteAfterDays(ctx, key, afterDays)
-	if err != nil {
-		failedRsHosts[host] = struct{}{}
-		failHostName(host)
-		elog.Info("deleteAfterDays retry 0", host, err)
-		host = l.nextRsHost(failedRsHosts)
-		bucket = l.newBucket(host, "", "")
-		err = bucket.DeleteAfterDays(ctx, key, afterDays)
-		if err != nil {
-			failedRsHosts[host] = struct{}{}
-			failHostName(host)
-			elog.Info("deleteAfterDays retry 1", host, err)
-			return err
-		} else {
-			succeedHostName(host)
-		}
-	} else {
-		succeedHostName(host)
-	}
-	return nil
+	return l.renameAsRename(ctx, key, keyAfterRename)
 }
 
 func (l *singleClusterLister) delete(key string) error {
 	if l.recycleBin != "" { // 启用回收站功能
-		return l.renameAsDelete(context.Background(), key, l.recycleBin, l.autoDeleteAfterDays)
+		return l.renameAsDelete(context.Background(), key, l.recycleBin)
 	} else {
 		return l.deleteAsDelete(context.Background(), key)
 	}
@@ -726,13 +687,13 @@ func (l *singleClusterLister) listStatWithRetries(ctx context.Context, paths []s
 
 func (l *singleClusterLister) deleteKeys(ctx context.Context, keys []string) ([]*DeleteKeysError, error) {
 	if l.recycleBin != "" {
-		return l.renameAsDeleteKeys(ctx, keys, l.recycleBin, l.autoDeleteAfterDays)
+		return l.renameAsDeleteKeys(ctx, keys, l.recycleBin)
 	} else {
 		return l.deleteAsDeleteKeysWithRetries(ctx, keys, 10, 0)
 	}
 }
 
-func (l *singleClusterLister) renameAsDeleteKeys(ctx context.Context, paths []string, recycleBin string, autoDeleteAfterDays int) ([]*DeleteKeysError, error) {
+func (l *singleClusterLister) renameAsDeleteKeys(ctx context.Context, paths []string, recycleBin string) ([]*DeleteKeysError, error) {
 	var (
 		errors     = make([]*DeleteKeysError, len(paths))
 		errorsLock sync.Mutex
@@ -741,7 +702,7 @@ func (l *singleClusterLister) renameAsDeleteKeys(ctx context.Context, paths []st
 	for i := 0; i < len(paths); i += 1 {
 		func(index int) {
 			pool.Go(func(ctx context.Context) error {
-				err := l.renameAsDelete(ctx, paths[index], recycleBin, autoDeleteAfterDays)
+				err := l.renameAsDelete(ctx, paths[index], recycleBin)
 				if err != nil {
 					deleteKeysErr := DeleteKeysError{Name: paths[index]}
 					if errorInfo, ok := err.(*rpc.ErrorInfo); ok {
