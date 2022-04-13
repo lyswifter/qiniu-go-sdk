@@ -69,6 +69,16 @@ func (p Bucket) Move(ctx context.Context, keySrc, keyDest string) (err error) {
 	return p.Conn.Call(ctx, nil, "POST", p.Conn.RSHost+URIMove(p.Name, keySrc, p.Name, keyDest))
 }
 
+// 重命名一个文件。
+//
+// ctx     是请求的上下文。
+// keySrc  是要移动的文件的旧路径。
+// keyDest 是要移动的文件的新路径。
+//
+func (p Bucket) Rename(ctx context.Context, keySrc, keyDest string) (err error) {
+	return p.Conn.Call(ctx, nil, "POST", p.Conn.APIHost+URIRename(p.Name, keySrc, p.Name, keyDest))
+}
+
 // 跨空间（bucket）移动一个文件。
 //
 // ctx        是请求的上下文。
@@ -245,6 +255,10 @@ func URICopy(bucketSrc, keySrc, bucketDest, keyDest string) string {
 
 func URIMove(bucketSrc, keySrc, bucketDest, keyDest string) string {
 	return "/move/" + encodeURI(bucketSrc+":"+keySrc) + "/" + encodeURI(bucketDest+":"+keyDest)
+}
+
+func URIRename(bucketSrc, keySrc, bucketDest, keyDest string) string {
+	return "/rename/" + encodeURI(bucketSrc+":"+keySrc) + "/" + encodeURI(bucketDest+":"+keyDest)
 }
 
 func URIChangeMime(bucket, key, mime string) string {
