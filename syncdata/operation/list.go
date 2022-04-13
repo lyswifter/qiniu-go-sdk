@@ -422,7 +422,7 @@ func (l *singleClusterLister) nextApiServerHost(failedHosts map[string]struct{})
 	}
 }
 
-func (l *singleClusterLister) moveAsRename(fromKey, toKey string) error {
+func (l *singleClusterLister) renameByCallingMoveAPI(fromKey, toKey string) error {
 	failedRsHosts := make(map[string]struct{})
 	host := l.nextRsHost(failedRsHosts)
 	bucket := l.newBucket(host, "", "")
@@ -449,7 +449,7 @@ func (l *singleClusterLister) moveAsRename(fromKey, toKey string) error {
 	}
 }
 
-func (l *singleClusterLister) renameAsRename(ctx context.Context, fromKey, toKey string) error {
+func (l *singleClusterLister) renameByCallingRenameAPI(ctx context.Context, fromKey, toKey string) error {
 	failedApiServerHosts := make(map[string]struct{})
 	host := l.nextApiServerHost(failedApiServerHosts)
 	bucket := l.newBucket("", "", host)
@@ -478,9 +478,9 @@ func (l *singleClusterLister) renameAsRename(ctx context.Context, fromKey, toKey
 
 func (l *singleClusterLister) rename(fromKey, toKey string) error {
 	if l.recycleBin != "" { // 启用回收站功能表示 RENAME API 可用
-		return l.renameAsRename(context.Background(), fromKey, toKey)
+		return l.renameByCallingRenameAPI(context.Background(), fromKey, toKey)
 	} else {
-		return l.moveAsRename(fromKey, toKey)
+		return l.renameByCallingMoveAPI(fromKey, toKey)
 	}
 }
 
@@ -538,7 +538,7 @@ func (l *singleClusterLister) copy(fromKey, toKey string) error {
 	}
 }
 
-func (l *singleClusterLister) deleteAsDelete(ctx context.Context, key string) error {
+func (l *singleClusterLister) deleteByCallingDeleteAPI(ctx context.Context, key string) error {
 	failedRsHosts := make(map[string]struct{})
 	host := l.nextRsHost(failedRsHosts)
 	bucket := l.newBucket(host, "", "")
@@ -565,21 +565,21 @@ func (l *singleClusterLister) deleteAsDelete(ctx context.Context, key string) er
 	}
 }
 
-func (l *singleClusterLister) renameAsDelete(ctx context.Context, key string, recycleBin string) error {
+func (l *singleClusterLister) putInRecycleBin(ctx context.Context, key string, recycleBin string) error {
 	keyAfterRename := recycleBin
 	if !strings.HasSuffix(keyAfterRename, "/") {
 		keyAfterRename += "/"
 	}
 	keyAfterRename += key
-	l.deleteAsDelete(ctx, keyAfterRename)
-	return l.renameAsRename(ctx, key, keyAfterRename)
+	l.deleteByCallingDeleteAPI(ctx, keyAfterRename)
+	return l.renameByCallingRenameAPI(ctx, key, keyAfterRename)
 }
 
 func (l *singleClusterLister) delete(key string) error {
 	if l.recycleBin != "" { // 启用回收站功能
-		return l.renameAsDelete(context.Background(), key, l.recycleBin)
+		return l.putInRecycleBin(context.Background(), key, l.recycleBin)
 	} else {
-		return l.deleteAsDelete(context.Background(), key)
+		return l.deleteByCallingDeleteAPI(context.Background(), key)
 	}
 }
 
@@ -693,7 +693,7 @@ func (l *singleClusterLister) renameAsDeleteKeys(ctx context.Context, paths []st
 	for i := 0; i < len(paths); i += 1 {
 		func(index int) {
 			pool.Go(func(ctx context.Context) error {
-				err := l.renameAsDelete(ctx, paths[index], recycleBin)
+				err := l.putInRecycleBin(ctx, paths[index], recycleBin)
 				if err != nil {
 					deleteKeysErr := DeleteKeysError{Name: paths[index]}
 					if errorInfo, ok := err.(*rpc.ErrorInfo); ok {
