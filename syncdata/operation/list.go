@@ -123,8 +123,17 @@ func (l *Lister) canTransfer(fromKey, toKey string) (*Config, error) {
 	return configOfFromKey, nil
 }
 
-// 删除指定对象
+// 删除指定对象，如果配置了回收站，该 API 将会将文件移动到回收站中，而不做实际的删除
 func (l *Lister) Delete(key string) error {
+	return l.delete(key, false)
+}
+
+// 强制删除指定对象，无论是否配置回收站，该 API 都会直接删除文件
+func (l *Lister) ForceDelete(key string) error {
+	return l.delete(key, true)
+}
+
+func (l *Lister) delete(key string, isForce bool) error {
 	var scl *singleClusterLister
 	if l.singleClusterLister != nil {
 		scl = l.singleClusterLister
@@ -135,7 +144,7 @@ func (l *Lister) Delete(key string) error {
 		}
 		scl = newSingleClusterLister(c)
 	}
-	return scl.delete(key)
+	return scl.delete(key, isForce)
 }
 
 // 获取指定对象列表的元信息
@@ -237,14 +246,19 @@ func (l *Lister) listPrefixForConfig(ctx context.Context, config *Config, prefix
 	return newSingleClusterLister(config).listPrefix(ctx, prefix)
 }
 
-// 删除多个对象
+// 删除多个对象，如果配置了回收站，该 API 将会将文件移动到回收站中，而不做实际的删除
 func (l *Lister) DeleteKeys(keys []string) ([]*DeleteKeysError, error) {
-	return l.deleteKeys(context.Background(), keys)
+	return l.deleteKeys(context.Background(), keys, false)
 }
 
-func (l *Lister) deleteKeys(ctx context.Context, keys []string) ([]*DeleteKeysError, error) {
+// 强制删除多个对象，无论是否配置回收站，该 API 都会直接删除文件
+func (l *Lister) ForceDeleteKeys(keys []string) ([]*DeleteKeysError, error) {
+	return l.deleteKeys(context.Background(), keys, true)
+}
+
+func (l *Lister) deleteKeys(ctx context.Context, keys []string, isForce bool) ([]*DeleteKeysError, error) {
 	if l.singleClusterLister != nil {
-		return l.singleClusterLister.deleteKeys(ctx, keys)
+		return l.singleClusterLister.deleteKeys(ctx, keys, isForce)
 	}
 
 	type KeysWithIndex struct {
@@ -274,7 +288,7 @@ func (l *Lister) deleteKeys(ctx context.Context, keys []string) ([]*DeleteKeysEr
 	for config, keysWithIndex := range clusterPathsMap {
 		func(config *Config, keys []string, indexMap []int) {
 			pool.Go(func(ctx context.Context) error {
-				if errors, err := l.deleteKeysForConfig(ctx, config, keys); err != nil {
+				if errors, err := l.deleteKeysForConfig(ctx, config, keys, isForce); err != nil {
 					return err
 				} else {
 					for i := range errors {
@@ -289,8 +303,8 @@ func (l *Lister) deleteKeys(ctx context.Context, keys []string) ([]*DeleteKeysEr
 	return allErrors, err
 }
 
-func (l *Lister) deleteKeysForConfig(ctx context.Context, config *Config, keys []string) ([]*DeleteKeysError, error) {
-	return newSingleClusterLister(config).deleteKeys(ctx, keys)
+func (l *Lister) deleteKeysForConfig(ctx context.Context, config *Config, keys []string, isForce bool) ([]*DeleteKeysError, error) {
+	return newSingleClusterLister(config).deleteKeys(ctx, keys, isForce)
 }
 
 func newSingleClusterLister(c *Config) *singleClusterLister {
@@ -575,8 +589,8 @@ func (l *singleClusterLister) putInRecycleBin(ctx context.Context, key string, r
 	return l.renameByCallingRenameAPI(ctx, key, keyAfterRename)
 }
 
-func (l *singleClusterLister) delete(key string) error {
-	if l.recycleBin != "" { // 启用回收站功能
+func (l *singleClusterLister) delete(key string, isForce bool) error {
+	if !isForce && l.recycleBin != "" { // 启用回收站功能
 		return l.putInRecycleBin(context.Background(), key, l.recycleBin)
 	} else {
 		return l.deleteByCallingDeleteAPI(context.Background(), key)
@@ -676,8 +690,8 @@ func (l *singleClusterLister) listStatWithRetries(ctx context.Context, paths []s
 	return stats, nil
 }
 
-func (l *singleClusterLister) deleteKeys(ctx context.Context, keys []string) ([]*DeleteKeysError, error) {
-	if l.recycleBin != "" {
+func (l *singleClusterLister) deleteKeys(ctx context.Context, keys []string, isForce bool) ([]*DeleteKeysError, error) {
+	if !isForce && l.recycleBin != "" {
 		return l.renameAsDeleteKeys(ctx, keys, l.recycleBin)
 	} else {
 		return l.deleteAsDeleteKeysWithRetries(ctx, keys, 10, 0)
