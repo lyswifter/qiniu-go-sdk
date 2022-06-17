@@ -8,11 +8,14 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 
 	"github.com/qiniupd/qiniu-go-sdk/api.v7/auth/qbox"
 	"github.com/qiniupd/qiniu-go-sdk/api.v7/kodo"
+	"github.com/qiniupd/qiniu-go-sdk/x/httputil.v1"
+	"github.com/qiniupd/qiniu-go-sdk/x/rpc.v7"
 )
 
 var (
@@ -120,8 +123,17 @@ func (l *Lister) canTransfer(fromKey, toKey string) (*Config, error) {
 	return configOfFromKey, nil
 }
 
-// 删除指定对象
+// 删除指定对象，如果配置了回收站，该 API 将会将文件移动到回收站中，而不做实际的删除
 func (l *Lister) Delete(key string) error {
+	return l.delete(key, false)
+}
+
+// 强制删除指定对象，无论是否配置回收站，该 API 都会直接删除文件
+func (l *Lister) ForceDelete(key string) error {
+	return l.delete(key, true)
+}
+
+func (l *Lister) delete(key string, isForce bool) error {
 	var scl *singleClusterLister
 	if l.singleClusterLister != nil {
 		scl = l.singleClusterLister
@@ -132,7 +144,7 @@ func (l *Lister) Delete(key string) error {
 		}
 		scl = newSingleClusterLister(c)
 	}
-	return scl.delete(key)
+	return scl.delete(key, isForce)
 }
 
 // 获取指定对象列表的元信息
@@ -187,7 +199,7 @@ func (l *Lister) listStat(ctx context.Context, keys []string) ([]*FileStat, erro
 			})
 		}(config, keysWithIndex.Keys, keysWithIndex.IndexMap)
 	}
-	err := pool.Wait(context.Background())
+	err := pool.Wait(ctx)
 	return allStats, err
 }
 
@@ -234,6 +246,67 @@ func (l *Lister) listPrefixForConfig(ctx context.Context, config *Config, prefix
 	return newSingleClusterLister(config).listPrefix(ctx, prefix)
 }
 
+// 删除多个对象，如果配置了回收站，该 API 将会将文件移动到回收站中，而不做实际的删除
+func (l *Lister) DeleteKeys(keys []string) ([]*DeleteKeysError, error) {
+	return l.deleteKeys(context.Background(), keys, false)
+}
+
+// 强制删除多个对象，无论是否配置回收站，该 API 都会直接删除文件
+func (l *Lister) ForceDeleteKeys(keys []string) ([]*DeleteKeysError, error) {
+	return l.deleteKeys(context.Background(), keys, true)
+}
+
+func (l *Lister) deleteKeys(ctx context.Context, keys []string, isForce bool) ([]*DeleteKeysError, error) {
+	if l.singleClusterLister != nil {
+		return l.singleClusterLister.deleteKeys(ctx, keys, isForce)
+	}
+
+	type KeysWithIndex struct {
+		IndexMap []int
+		Keys     []string
+	}
+
+	clusterPathsMap := make(map[*Config]*KeysWithIndex)
+	for i, key := range keys {
+		config, exists := l.config.forKey(key)
+		if !exists {
+			return nil, ErrUndefinedConfig
+		}
+		if keysWithIndex := clusterPathsMap[config]; keysWithIndex != nil {
+			keysWithIndex.IndexMap = append(keysWithIndex.IndexMap, i)
+			keysWithIndex.Keys = append(keysWithIndex.Keys, key)
+		} else {
+			keysWithIndex = &KeysWithIndex{Keys: make([]string, 0, 1), IndexMap: make([]int, 0, 1)}
+			keysWithIndex.IndexMap = append(keysWithIndex.IndexMap, i)
+			keysWithIndex.Keys = append(keysWithIndex.Keys, key)
+			clusterPathsMap[config] = keysWithIndex
+		}
+	}
+
+	pool := newGoroutinePool(l.multiClustersConcurrency)
+	allErrors := make([]*DeleteKeysError, len(keys))
+	for config, keysWithIndex := range clusterPathsMap {
+		func(config *Config, keys []string, indexMap []int) {
+			pool.Go(func(ctx context.Context) error {
+				if errors, err := l.deleteKeysForConfig(ctx, config, keys, isForce); err != nil {
+					return err
+				} else {
+					for i := range errors {
+						allErrors[indexMap[i]] = errors[i]
+					}
+					return nil
+				}
+			})
+		}(config, keysWithIndex.Keys, keysWithIndex.IndexMap)
+	}
+	err := pool.Wait(ctx)
+	return allErrors, err
+}
+
+func (l *Lister) deleteKeysForConfig(ctx context.Context, config *Config, keys []string, isForce bool) ([]*DeleteKeysError, error) {
+	return newSingleClusterLister(config).deleteKeys(ctx, keys, isForce)
+}
+
 func newSingleClusterLister(c *Config) *singleClusterLister {
 	mac := qbox.NewMac(c.Ak, c.Sk)
 
@@ -248,10 +321,12 @@ func newSingleClusterLister(c *Config) *singleClusterLister {
 		rsHosts:          dupStrings(c.RsHosts),
 		upHosts:          dupStrings(c.UpHosts),
 		rsfHosts:         dupStrings(c.RsfHosts),
+		apiServerHosts:   dupStrings(c.ApiServerHosts),
 		credentials:      mac,
 		queryer:          queryer,
 		batchConcurrency: c.BatchConcurrency,
 		batchSize:        c.BatchSize,
+		recycleBin:       c.RecycleBin,
 	}
 	if lister.batchConcurrency <= 0 {
 		lister.batchConcurrency = 20
@@ -262,6 +337,7 @@ func newSingleClusterLister(c *Config) *singleClusterLister {
 	shuffleHosts(lister.rsHosts)
 	shuffleHosts(lister.rsfHosts)
 	shuffleHosts(lister.upHosts)
+	shuffleHosts(lister.apiServerHosts)
 	return &lister
 }
 
@@ -270,10 +346,12 @@ type singleClusterLister struct {
 	rsHosts          []string
 	upHosts          []string
 	rsfHosts         []string
+	apiServerHosts   []string
 	credentials      *qbox.Mac
 	queryer          *Queryer
 	batchSize        int
 	batchConcurrency int
+	recycleBin       string
 }
 
 var curRsHostIndex uint32 = 0
@@ -332,108 +410,191 @@ func (l *singleClusterLister) nextRsfHost(failedHosts map[string]struct{}) strin
 	}
 }
 
-func (l *singleClusterLister) rename(fromKey, toKey string) error {
+func (l *singleClusterLister) nextApiServerHost(failedHosts map[string]struct{}) string {
+	apiServerHosts := l.apiServerHosts
+	if l.queryer != nil {
+		if hosts := l.queryer.QueryApiServerHosts(false); len(hosts) > 0 {
+			shuffleHosts(hosts)
+			apiServerHosts = hosts
+		}
+	}
+	switch len(apiServerHosts) {
+	case 0:
+		panic("No ApiServer hosts is configured")
+	case 1:
+		return apiServerHosts[0]
+	default:
+		var apiServerHost string
+		for i := 0; i <= len(apiServerHosts)*MaxFindHostsPrecent/100; i++ {
+			index := int(atomic.AddUint32(&curApiServerHostIndex, 1) - 1)
+			apiServerHost = apiServerHosts[index%len(apiServerHosts)]
+			if _, isFailedBefore := failedHosts[apiServerHost]; !isFailedBefore && isHostNameValid(apiServerHost) {
+				break
+			}
+		}
+		return apiServerHost
+	}
+}
+
+func (l *singleClusterLister) renameByCallingMoveAPI(fromKey, toKey string) error {
 	failedRsHosts := make(map[string]struct{})
 	host := l.nextRsHost(failedRsHosts)
-	bucket := l.newBucket(host, "")
+	bucket := l.newBucket(host, "", "")
 	err := bucket.Move(nil, fromKey, toKey)
-	if err != nil {
+	if !isServerError(err) {
+		succeedHostName(host)
+		return err
+	} else {
 		failedRsHosts[host] = struct{}{}
 		failHostName(host)
-		elog.Info("rename retry 0", host, err)
+		elog.Info("move retry 0", host, err)
 		host = l.nextRsHost(failedRsHosts)
-		bucket = l.newBucket(host, "")
+		bucket = l.newBucket(host, "", "")
 		err = bucket.Move(nil, fromKey, toKey)
-		if err != nil {
+		if !isServerError(err) {
+			succeedHostName(host)
+			return err
+		} else {
 			failedRsHosts[host] = struct{}{}
+			failHostName(host)
+			elog.Info("move retry 1", host, err)
+			return err
+		}
+	}
+}
+
+func (l *singleClusterLister) renameByCallingRenameAPI(ctx context.Context, fromKey, toKey string) error {
+	failedApiServerHosts := make(map[string]struct{})
+	host := l.nextApiServerHost(failedApiServerHosts)
+	bucket := l.newBucket("", "", host)
+	err := bucket.Rename(ctx, fromKey, toKey)
+	if !isServerError(err) {
+		succeedHostName(host)
+		return err
+	} else {
+		failedApiServerHosts[host] = struct{}{}
+		failHostName(host)
+		elog.Info("rename retry 0", host, err)
+		host = l.nextApiServerHost(failedApiServerHosts)
+		bucket = l.newBucket("", "", host)
+		err = bucket.Rename(ctx, fromKey, toKey)
+		if !isServerError(err) {
+			succeedHostName(host)
+			return err
+		} else {
+			failedApiServerHosts[host] = struct{}{}
 			failHostName(host)
 			elog.Info("rename retry 1", host, err)
 			return err
-		} else {
-			succeedHostName(host)
 		}
-	} else {
-		succeedHostName(host)
 	}
-	return nil
+}
+
+func (l *singleClusterLister) rename(fromKey, toKey string) error {
+	if l.recycleBin != "" { // 启用回收站功能表示 RENAME API 可用
+		return l.renameByCallingRenameAPI(context.Background(), fromKey, toKey)
+	} else {
+		return l.renameByCallingMoveAPI(fromKey, toKey)
+	}
 }
 
 func (l *singleClusterLister) moveTo(fromKey, toBucket, toKey string) error {
 	failedRsHosts := make(map[string]struct{})
 	host := l.nextRsHost(failedRsHosts)
-	bucket := l.newBucket(host, "")
+	bucket := l.newBucket(host, "", "")
 	err := bucket.MoveEx(nil, fromKey, toBucket, toKey)
-	if err != nil {
+	if !isServerError(err) {
+		succeedHostName(host)
+		return err
+	} else {
 		failedRsHosts[host] = struct{}{}
 		failHostName(host)
 		elog.Info("move retry 0", host, err)
 		host = l.nextRsHost(failedRsHosts)
-		bucket = l.newBucket(host, "")
+		bucket = l.newBucket(host, "", "")
 		err = bucket.MoveEx(nil, fromKey, toBucket, toKey)
-		if err != nil {
+		if !isServerError(err) {
+			succeedHostName(host)
+			return err
+		} else {
 			failedRsHosts[host] = struct{}{}
 			failHostName(host)
 			elog.Info("move retry 1", host, err)
 			return err
-		} else {
-			succeedHostName(host)
 		}
-	} else {
-		succeedHostName(host)
 	}
-	return nil
 }
 
 func (l *singleClusterLister) copy(fromKey, toKey string) error {
 	failedRsHosts := make(map[string]struct{})
 	host := l.nextRsHost(failedRsHosts)
-	bucket := l.newBucket(host, "")
+	bucket := l.newBucket(host, "", "")
 	err := bucket.Copy(nil, fromKey, toKey)
-	if err != nil {
+	if !isServerError(err) {
+		succeedHostName(host)
+		return err
+	} else {
 		failedRsHosts[host] = struct{}{}
 		failHostName(host)
 		elog.Info("copy retry 0", host, err)
 		host = l.nextRsHost(failedRsHosts)
-		bucket = l.newBucket(host, "")
+		bucket = l.newBucket(host, "", "")
 		err = bucket.Copy(nil, fromKey, toKey)
-		if err != nil {
+		if !isServerError(err) {
+			succeedHostName(host)
+			return err
+		} else {
 			failedRsHosts[host] = struct{}{}
 			failHostName(host)
 			elog.Info("copy retry 1", host, err)
 			return err
-		} else {
-			succeedHostName(host)
 		}
-	} else {
-		succeedHostName(host)
 	}
-	return nil
 }
 
-func (l *singleClusterLister) delete(key string) error {
+func (l *singleClusterLister) deleteByCallingDeleteAPI(ctx context.Context, key string) error {
 	failedRsHosts := make(map[string]struct{})
 	host := l.nextRsHost(failedRsHosts)
-	bucket := l.newBucket(host, "")
-	err := bucket.Delete(nil, key)
-	if err != nil {
+	bucket := l.newBucket(host, "", "")
+	err := bucket.Delete(ctx, key)
+	if !isServerError(err) {
+		succeedHostName(host)
+		return err
+	} else {
 		failedRsHosts[host] = struct{}{}
 		failHostName(host)
 		elog.Info("delete retry 0", host, err)
 		host = l.nextRsHost(failedRsHosts)
-		bucket = l.newBucket(host, "")
-		err = bucket.Delete(nil, key)
-		if err != nil {
+		bucket = l.newBucket(host, "", "")
+		err = bucket.Delete(ctx, key)
+		if !isServerError(err) {
+			succeedHostName(host)
+			return err
+		} else {
 			failedRsHosts[host] = struct{}{}
 			failHostName(host)
 			elog.Info("delete retry 1", host, err)
 			return err
-		} else {
-			succeedHostName(host)
 		}
-	} else {
-		succeedHostName(host)
 	}
-	return nil
+}
+
+func (l *singleClusterLister) putInRecycleBin(ctx context.Context, key string, recycleBin string) error {
+	keyAfterRename := recycleBin
+	if !strings.HasSuffix(keyAfterRename, "/") {
+		keyAfterRename += "/"
+	}
+	keyAfterRename += key
+	l.deleteByCallingDeleteAPI(ctx, keyAfterRename)
+	return l.renameByCallingRenameAPI(ctx, key, keyAfterRename)
+}
+
+func (l *singleClusterLister) delete(key string, isForce bool) error {
+	if !isForce && l.recycleBin != "" { // 启用回收站功能
+		return l.putInRecycleBin(context.Background(), key, l.recycleBin)
+	} else {
+		return l.deleteByCallingDeleteAPI(context.Background(), key)
+	}
 }
 
 func (l *singleClusterLister) listStat(ctx context.Context, paths []string) ([]*FileStat, error) {
@@ -464,7 +625,7 @@ func (l *singleClusterLister) listStatWithRetries(ctx context.Context, paths []s
 				failedRsHostsLock.RLock()
 				host := l.nextRsHost(failedRsHosts)
 				failedRsHostsLock.RUnlock()
-				bucket := l.newBucket(host, "")
+				bucket := l.newBucket(host, "", "")
 				r, err := bucket.BatchStat(ctx, paths...)
 				if err != nil {
 					failedRsHostsLock.Lock()
@@ -475,7 +636,7 @@ func (l *singleClusterLister) listStatWithRetries(ctx context.Context, paths []s
 					failedRsHostsLock.RLock()
 					host = l.nextRsHost(failedRsHosts)
 					failedRsHostsLock.RUnlock()
-					bucket = l.newBucket(host, "")
+					bucket = l.newBucket(host, "", "")
 					r, err = bucket.BatchStat(ctx, paths...)
 					if err != nil {
 						failedRsHostsLock.Lock()
@@ -529,11 +690,146 @@ func (l *singleClusterLister) listStatWithRetries(ctx context.Context, paths []s
 	return stats, nil
 }
 
+func (l *singleClusterLister) deleteKeys(ctx context.Context, keys []string, isForce bool) ([]*DeleteKeysError, error) {
+	if !isForce && l.recycleBin != "" {
+		return l.renameAsDeleteKeys(ctx, keys, l.recycleBin)
+	} else {
+		return l.deleteAsDeleteKeysWithRetries(ctx, keys, 10, 0)
+	}
+}
+
+func (l *singleClusterLister) renameAsDeleteKeys(ctx context.Context, paths []string, recycleBin string) ([]*DeleteKeysError, error) {
+	var (
+		errors     = make([]*DeleteKeysError, len(paths))
+		errorsLock sync.Mutex
+		pool       = newGoroutinePool(l.batchConcurrency)
+	)
+	for i := 0; i < len(paths); i += 1 {
+		func(index int) {
+			pool.Go(func(ctx context.Context) error {
+				err := l.putInRecycleBin(ctx, paths[index], recycleBin)
+				if err != nil {
+					deleteKeysErr := DeleteKeysError{Name: paths[index]}
+					if errorInfo, ok := err.(*rpc.ErrorInfo); ok {
+						deleteKeysErr.Code = errorInfo.HttpCode()
+						deleteKeysErr.Error = errorInfo.Error()
+					} else {
+						deleteKeysErr.Code = httputil.DetectCode(err)
+						deleteKeysErr.Error = err.Error()
+					}
+					errorsLock.Lock()
+					errors[index] = &deleteKeysErr
+					errorsLock.Unlock()
+				}
+				return nil
+			})
+		}(i)
+	}
+	if err := pool.Wait(ctx); err != nil {
+		return nil, err
+	}
+	return errors, nil
+}
+
+func (l *singleClusterLister) deleteAsDeleteKeysWithRetries(ctx context.Context, paths []string, retries, retried uint) ([]*DeleteKeysError, error) {
+	concurrency := (len(paths) + l.batchSize - 1) / l.batchSize
+	if concurrency > l.batchConcurrency {
+		concurrency = l.batchConcurrency
+	}
+	var (
+		errors             = make([]*DeleteKeysError, len(paths))
+		failedPath         []string
+		failedPathIndexMap []int
+		failedRsHosts      = make(map[string]struct{})
+		failedRsHostsLock  sync.RWMutex
+		pool               = newGoroutinePool(concurrency)
+	)
+
+	for i := 0; i < len(paths); i += l.batchSize {
+		size := l.batchSize
+		if size > len(paths)-i {
+			size = len(paths) - i
+		}
+		func(paths []string, index int) {
+			pool.Go(func(ctx context.Context) error {
+				failedRsHostsLock.RLock()
+				host := l.nextRsHost(failedRsHosts)
+				failedRsHostsLock.RUnlock()
+				bucket := l.newBucket(host, "", "")
+				r, err := bucket.BatchDelete(ctx, paths...)
+				if err != nil {
+					failedRsHostsLock.Lock()
+					failedRsHosts[host] = struct{}{}
+					failedRsHostsLock.Unlock()
+					failHostName(host)
+					elog.Info("batchDelete retry 0", host, err)
+					failedRsHostsLock.RLock()
+					host = l.nextRsHost(failedRsHosts)
+					failedRsHostsLock.RUnlock()
+					bucket = l.newBucket(host, "", "")
+					r, err = bucket.BatchDelete(ctx, paths...)
+					if err != nil {
+						failedRsHostsLock.Lock()
+						failedRsHosts[host] = struct{}{}
+						failedRsHostsLock.Unlock()
+						failHostName(host)
+						elog.Info("batchDelete retry 1", host, err)
+						return err
+					} else {
+						succeedHostName(host)
+					}
+				} else {
+					succeedHostName(host)
+				}
+				for j, v := range r {
+					if v.Code != 200 {
+						errors[index+j] = &DeleteKeysError{Name: paths[j], Error: v.Error, Code: v.Code}
+						elog.Warn("delete bad file:", paths[j], "with code:", v.Code)
+					} else {
+						errors[index+j] = nil
+					}
+				}
+				return nil
+			})
+		}(paths[i:i+size], i)
+	}
+	if err := pool.Wait(ctx); err != nil {
+		return nil, err
+	}
+
+	if retries > 0 {
+		for i, e := range errors {
+			if e != nil && e.Code/100 == 5 {
+				failedPathIndexMap = append(failedPathIndexMap, i)
+				failedPath = append(failedPath, e.Name)
+				elog.Warn("redelete bad file:", e.Name, "with code:", e.Code)
+			}
+		}
+		if len(failedPath) > 0 {
+			elog.Warn("redelete ", len(failedPath), " bad files, retried:", retried)
+			retriedErrors, err := l.deleteAsDeleteKeysWithRetries(ctx, failedPath, retries-1, retried+1)
+			if err != nil {
+				return errors, err
+			}
+			for i, retriedError := range retriedErrors {
+				errors[failedPathIndexMap[i]] = retriedError
+			}
+		}
+	}
+
+	return errors, nil
+}
+
+type DeleteKeysError struct {
+	Error string
+	Code  int
+	Name  string
+}
+
 func (l *singleClusterLister) listPrefix(ctx context.Context, prefix string) ([]string, error) {
 	failedHosts := make(map[string]struct{})
-	rsHost := l.nextRsHost(failedHosts)
 	rsfHost := l.nextRsfHost(failedHosts)
-	bucket := l.newBucket(rsHost, rsfHost)
+	bucket := l.newBucket("", rsfHost, "")
 	var files []string
 	marker := ""
 	for {
@@ -543,7 +839,7 @@ func (l *singleClusterLister) listPrefix(ctx context.Context, prefix string) ([]
 			failHostName(rsfHost)
 			elog.Info("ListPrefix retry 0", rsfHost, err)
 			rsfHost = l.nextRsfHost(failedHosts)
-			bucket = l.newBucket(rsHost, rsfHost)
+			bucket = l.newBucket("", rsfHost, "")
 			r, _, out, err = bucket.List(ctx, prefix, "", marker, 1000)
 			if err != nil && err != io.EOF {
 				failedHosts[rsfHost] = struct{}{}
@@ -569,12 +865,13 @@ func (l *singleClusterLister) listPrefix(ctx context.Context, prefix string) ([]
 	return files, nil
 }
 
-func (l *singleClusterLister) newBucket(host, rsfHost string) kodo.Bucket {
+func (l *singleClusterLister) newBucket(host, rsfHost, apiHost string) kodo.Bucket {
 	cfg := kodo.Config{
 		AccessKey: l.credentials.AccessKey,
 		SecretKey: string(l.credentials.SecretKey),
 		RSHost:    host,
 		RSFHost:   rsfHost,
+		APIHost:   apiHost,
 		UpHosts:   l.upHosts,
 	}
 	client := kodo.NewWithoutZone(&cfg)
@@ -590,4 +887,12 @@ func (l *Lister) batchStab(r io.Reader) []*FileStat {
 		return nil
 	}
 	return l.ListStat(fl)
+}
+
+func isServerError(err error) bool {
+	if err != nil {
+		code := httputil.DetectCode(err)
+		return code/100 == 5
+	}
+	return false
 }
